@@ -1,0 +1,175 @@
+# -*- coding: utf-8 -*-
+"""config 模块单元测试：配置读写、历史追加、批次弹出。"""
+import os
+
+import config as cfg
+
+
+def test_load_config_defaults_when_missing(tmp_path, monkeypatch):
+    """配置文件不存在时应返回默认配置。"""
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "s.json"))
+    monkeypatch.setattr(cfg, "HISTORY_PATH", str(tmp_path / "h.json"))
+    data = cfg.load_config()
+    assert data["storageRoot"] == cfg.DEFAULT_CONFIG["storageRoot"]
+    assert isinstance(data["categories"], list)
+
+
+def test_load_config_corrupt_file_returns_default(tmp_path, monkeypatch):
+    """配置文件损坏时应静默退回默认配置。"""
+    bad = tmp_path / "s.json"
+    bad.write_text("{not valid json", encoding="utf-8")
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(bad))
+    monkeypatch.setattr(cfg, "HISTORY_PATH", str(tmp_path / "h.json"))
+    assert cfg.load_config() == cfg.DEFAULT_CONFIG
+
+
+def test_config_roundtrip(tmp_path, monkeypatch):
+    """保存后读取应得到相同内容。"""
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "s.json"))
+    monkeypatch.setattr(cfg, "HISTORY_PATH", str(tmp_path / "h.json"))
+    data = dict(cfg.DEFAULT_CONFIG, storageRoot="D:/new/root")
+    cfg.save_config(data)
+    assert cfg.load_config()["storageRoot"] == "D:/new/root"
+
+
+def test_history_append_and_pop_batch(tmp_path, monkeypatch):
+    """追加多条记录后应能整批弹出最近批次。"""
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "s.json"))
+    monkeypatch.setattr(cfg, "HISTORY_PATH", str(tmp_path / "h.json"))
+    cfg.append_records([{"src": "a", "dst": "b", "batch": "b1"}])
+    cfg.append_records([{"src": "c", "dst": "d", "batch": "b2"}])
+
+    popped = cfg.pop_last_batch()
+    assert len(popped) == 1 and popped[0]["batch"] == "b2"
+    remaining = cfg.load_history()
+    assert len(remaining) == 1 and remaining[0]["batch"] == "b1"
+
+
+def test_pop_batch_empty_history(tmp_path, monkeypatch):
+    """历史为空时 pop 应返回空列表且不报错。"""
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "s.json"))
+    monkeypatch.setattr(cfg, "HISTORY_PATH", str(tmp_path / "h.json"))
+    assert cfg.pop_last_batch() == []
+
+
+def test_pop_last_batch_without_batch_falls_back_to_single(tmp_path, monkeypatch):
+    """历史末条没有 batch（旧数据）时应单条弹出，保证"撤销上次"始终可用。"""
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "s.json"))
+    monkeypatch.setattr(cfg, "HISTORY_PATH", str(tmp_path / "h.json"))
+    cfg.append_records([{"src": "a", "dst": "b", "batch": "b1"}])
+    cfg.append_records([{"src": "c", "dst": "d"}])          # 无 batch 的旧记录
+
+    popped = cfg.pop_last_batch()
+
+    assert len(popped) == 1 and popped[0]["src"] == "c"
+    assert [r["src"] for r in cfg.load_history()] == ["a"]
+
+
+def test_history_cap(tmp_path, monkeypatch):
+    """历史超过上限时应丢弃最旧记录。"""
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "s.json"))
+    monkeypatch.setattr(cfg, "HISTORY_PATH", str(tmp_path / "h.json"))
+    monkeypatch.setattr(cfg, "HISTORY_MAX_RECORDS", 3)
+    for i in range(5):
+        cfg.append_records([{"src": str(i), "dst": str(i), "batch": f"b{i}"}])
+    history = cfg.load_history()
+    assert len(history) == 3
+    assert history[0]["batch"] == "b2"  # 最旧两条已被丢弃
+
+
+# ---------- v2 新配置键 ----------
+
+def test_defaults_contain_v2_keys():
+    """默认配置应包含 v2 新增键。"""
+    for key in ("includeFolders", "autostart", "previewIcons",
+                "gameMode", "widgetPositions", "widgetSizes", "lockedWidgets",
+                "confirmOrganize", "panelGeometry", "widgetScales",
+                "widgetPreviews", "gridPaths", "autoOrganize",
+                "autoOrganizeDelay", "searchGrid"):
+        assert key in cfg.DEFAULT_CONFIG
+    assert cfg.FOLDER_CATEGORY in cfg.DEFAULT_CONFIG["categories"]
+
+
+def test_legacy_config_gets_folder_category(tmp_path, monkeypatch):
+    """v1 旧配置（无 widgetPositions）加载时应自动补"文件夹"分类。"""
+    old_cfg = tmp_path / "s.json"
+    old_cfg.write_text(
+        '{"storageRoot": "E:/old", "includeShortcuts": false,'
+        ' "categories": ["文档", "图片"]}', encoding="utf-8")
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(old_cfg))
+    monkeypatch.setattr(cfg, "HISTORY_PATH", str(tmp_path / "h.json"))
+
+    data = cfg.load_config()
+
+    assert data["storageRoot"] == "E:/old"          # 旧值保留
+    assert cfg.FOLDER_CATEGORY in data["categories"]  # 自动补文件夹分类
+
+
+def test_v2_config_not_renormalized(tmp_path, monkeypatch):
+    """v2 配置（有 widgetPositions）加载时不应强制补分类，尊重用户选择。"""
+    user_cfg = tmp_path / "s.json"
+    user_cfg.write_text(
+        '{"widgetPositions": {}, "categories": ["文档"]}', encoding="utf-8")
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(user_cfg))
+    monkeypatch.setattr(cfg, "HISTORY_PATH", str(tmp_path / "h.json"))
+
+    assert cfg.load_config()["categories"] == ["文档"]
+
+
+def test_position_format_parse_roundtrip():
+    """位置坐标序列化/解析应可互逆。"""
+    text = cfg.format_position(123, -45)
+    assert text == "123,-45"
+    assert cfg.parse_position(text) == (123, -45)
+
+
+def test_parse_position_invalid_returns_none():
+    """非法坐标字符串应返回 None 而不是抛异常。"""
+    assert cfg.parse_position("") is None
+    assert cfg.parse_position("abc,def") is None
+    assert cfg.parse_position("1,") is None
+    assert cfg.parse_position(None) is None
+
+
+# ---------- 格子名称 / 几何 / 历史路径工具 ----------
+
+def test_validate_grid_name():
+    """名称校验：合法通过，空/非法字符/重名/句点结尾应给出错误提示。"""
+    existing = ["文档", "课程资料"]
+    assert cfg.validate_grid_name("期末复习", existing) == ""
+    assert "不能为空" in cfg.validate_grid_name("   ", existing)
+    assert "已存在" in cfg.validate_grid_name("课程资料", existing)
+    assert "不能包含" in cfg.validate_grid_name("a/b", existing)
+    assert "句点" in cfg.validate_grid_name("资料.", existing)
+
+
+def test_geometry_roundtrip_and_invalid():
+    """窗口几何序列化/解析可互逆，非法输入返回 None。"""
+    text = cfg.format_geometry(10, 20, 480, 660)
+    assert text == "10,20,480,660"
+    assert cfg.parse_geometry(text) == (10, 20, 480, 660)
+    assert cfg.parse_geometry("1,2,3") is None
+    assert cfg.parse_geometry("a,b,c,d") is None
+    assert cfg.parse_geometry("") is None
+
+
+def test_retarget_history_prefix(tmp_path, monkeypatch):
+    """重命名格子后，历史记录中旧目录下的 dst 应改到新目录（含子目录）。"""
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "s.json"))
+    monkeypatch.setattr(cfg, "HISTORY_PATH", str(tmp_path / "h.json"))
+    old_dir = str(tmp_path / "旧格子")
+    new_dir = str(tmp_path / "新格子")
+    cfg.append_records([
+        {"src": "D:/a.pdf", "dst": os.path.join(old_dir, "a.pdf"), "batch": "b1"},
+        {"src": "D:/b.pdf", "dst": os.path.join(old_dir, "子目录", "b.pdf"),
+         "batch": "b1"},
+        {"src": "D:/c.pdf", "dst": "E:/elsewhere/c.pdf", "batch": "b2"},
+    ])
+
+    changed = cfg.retarget_history_prefix(old_dir, new_dir)
+
+    assert changed == 2
+    history = cfg.load_history()
+    assert history[0]["dst"] == os.path.join(new_dir, "a.pdf")
+    assert history[1]["dst"] == os.path.join(new_dir, "子目录", "b.pdf")
+    assert history[2]["dst"] == "E:/elsewhere/c.pdf"
