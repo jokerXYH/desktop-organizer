@@ -982,7 +982,11 @@ python -m pytest tests/ -q    # 期望 143 passed
 ### 发布规范（每版照做，v2.10.0 起）
 1. 升版本：`config.APP_VERSION` 与 CHANGELOG / README / PROJECT 同步；
 2. 打包：`python tools/build_exe.py` → `dist/桌面分类助手_v<版本>.exe`（文件名自带版本号）；
-3. 提交推送后，在 GitHub 发 Release（tag `v<版本>`），把该 exe 作为附件上传；
-4. 更新仓库根 `update.json`（version / url / sha256 / notes）——应用内「检查更新」
-   默认指向 `raw.githubusercontent.com/jokerXYH/desktop-organizer/main/update.json`；
+3. 提交推送后，在 GitHub 发 Release（tag `v<版本>`）。
+   **注意**：GitHub 附件名会剔除全部非 ASCII 字符（中文会丢），附件须用 ASCII 文件名
+   `desktop-organizer_v<版本>.exe`（本地 exe 仍保持中文名，两者是同一个文件）；
+4. 把 `update.json` 作为 **Release 附件**一并上传（内容 = 仓库根同名文件的副本：
+   version / url / sha256 / notes）——应用内「检查更新」默认指向稳定地址
+   `github.com/jokerXYH/desktop-organizer/releases/latest/download/update.json`
+   （实测 raw.githubusercontent 在国内直连不可达，release CDN 可达，故用附件方案）；
 5. 冒烟：旧版 exe 打开 → 检查更新 → 确认后应自动下载、替换并重启（源码形态只打开下载页）。
