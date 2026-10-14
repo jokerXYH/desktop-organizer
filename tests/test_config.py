@@ -2,6 +2,8 @@
 """config 模块单元测试：配置读写、历史追加、批次弹出。"""
 import os
 
+import pytest
+
 import config as cfg
 
 
@@ -173,3 +175,47 @@ def test_retarget_history_prefix(tmp_path, monkeypatch):
     assert history[0]["dst"] == os.path.join(new_dir, "a.pdf")
     assert history[1]["dst"] == os.path.join(new_dir, "子目录", "b.pdf")
     assert history[2]["dst"] == "E:/elsewhere/c.pdf"
+
+
+# ---------- 原子写入（防崩溃损坏） ----------
+
+def test_save_config_atomic_keeps_old_on_write_error(tmp_path, monkeypatch):
+    """写入中断（os.replace 失败）时旧配置保持完整，且不残留 .tmp 文件。"""
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "s.json"))
+    monkeypatch.setattr(cfg, "HISTORY_PATH", str(tmp_path / "h.json"))
+    cfg.save_config(dict(cfg.DEFAULT_CONFIG, storageRoot="E:/旧的"))
+    old_text = (tmp_path / "s.json").read_text(encoding="utf-8")
+
+    def interrupted(src, dst):
+        raise OSError("模拟崩溃/断电")
+
+    monkeypatch.setattr(os, "replace", interrupted)
+    with pytest.raises(OSError):
+        cfg.save_config(dict(cfg.DEFAULT_CONFIG, storageRoot="D:/新的"))
+    # 注意：不在用例内调用 monkeypatch.undo()，它会连 CONFIG_PATH 的补丁
+    # 一起撤销，导致后续断言写到真实用户目录去。
+
+    assert (tmp_path / "s.json").read_text(encoding="utf-8") == old_text
+    assert [p.name for p in tmp_path.iterdir()] == ["s.json"]   # 无 .tmp 残留
+
+
+def test_save_history_atomic(tmp_path, monkeypatch):
+    """历史文件原子写入：写入中断时不破坏旧历史，也不会残留 .tmp。"""
+    import json
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "s.json"))
+    monkeypatch.setattr(cfg, "HISTORY_PATH", str(tmp_path / "h.json"))
+    cfg.append_records([{"src": "a", "dst": "b", "batch": "b1"}])
+    old_text = (tmp_path / "h.json").read_text(encoding="utf-8")
+
+    def interrupted(src, dst):
+        raise OSError("模拟磁盘满")
+
+    monkeypatch.setattr(os, "replace", interrupted)
+    with pytest.raises(OSError):
+        cfg.save_history([{"src": "c", "dst": "d", "batch": "b2"}])
+
+    assert (tmp_path / "h.json").read_text(encoding="utf-8") == old_text
+    assert [p.name for p in tmp_path.iterdir()] == ["h.json"]
+    data = json.loads((tmp_path / "h.json").read_text(encoding="utf-8"))
+    assert data == [{"src": "a", "dst": "b", "batch": "b1"}]

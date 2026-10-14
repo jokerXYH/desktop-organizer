@@ -443,3 +443,30 @@ python -m pytest tests/ -q    # 期望 80 passed
 ### 新增测试（合计 80）
 - 八方向热区判定（含锁定）、`_resize_geometry` 全edge/钳制/吸附与指示线。
 - SearchWidget 基本行为（提示/结果/计数）、搜索格子集成（拼音命中/删除/恢复）。
+
+## 19. v2.6.1 Bug 修复与健壮性（2026-10-14）
+
+### 修复
+- **收纳目录守卫**：`_save_root` 绑定在 `editingFinished`（回车或失焦都触发，
+  实测 Qt 6.12 文本未改动也触发）。用户每次焦点经过输入框都会全量重建格子。
+  现在先做 `normcase(normpath(...))` 对比，值未变化直接 return，不写配置不重建。
+- **配置/历史原子写入**（config.py）：新增 `_atomic_write(path, data)`——
+  先 `json.dumps` 序列化，再写 `.tmp` 临时文件，最后 `os.replace` 原子替换；
+  失败路径会清理 tmp。彻底消除"崩溃瞬间损坏 JSON → 静默丢位置/丢撤销历史"。
+- **拖入批量落盘**（main.py `handle_drop`）：原来循环内每个文件调一次
+  `append_records`（每文件 load+save 全量历史，2000 条记录），现在整批
+  收集为 `records` 后单次写入。拖入返回值改为**失败路径列表**（供粘贴用）。
+- **粘贴失败保留**（`handle_paste_files`）：先整体换出剪切板 → 执行移动 →
+  失败且源仍存在的路径回填剪切板并提示"可换个格子或稍后重试"。
+  在同格"拖回被静默忽略"的条目仍不从剪切板保留（语义为用户误操作）。
+
+### 行为注意
+- `handle_drop` 现返回 `List[str]`（失败路径），原调用方（dropEvent、粘贴）
+  忽略返回值，不影响现有逻辑。
+
+### 新增测试（合计 85）
+- `test_save_config_atomic_keeps_old_on_write_error` /
+  `test_save_history_atomic`（写中断→旧文件完整、无 .tmp 残留）。
+- `test_handle_drop_writes_history_once`（3 文件一次落盘）。
+- `test_paste_failure_keeps_items_in_clipboard`（失败项回填剪切板）。
+- `test_save_root_ignores_no_change`（未改不重建；真正改动才写配置+重建）。

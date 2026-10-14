@@ -10,7 +10,7 @@ import os
 from typing import Any, Dict, List
 
 # 应用版本号（语义化版本：主版本.次版本.修订号；与 README / CHANGELOG 同步更新）
-APP_VERSION = "2.6.0"
+APP_VERSION = "2.6.1"
 
 # 配置目录与文件路径常量
 CONFIG_DIR = os.path.join(
@@ -144,11 +144,31 @@ def retarget_history_prefix(old_prefix: str, new_prefix: str) -> int:
     return changed
 
 
+def _atomic_write(path: str, data: str) -> None:
+    """原子写文件：先写临时文件再 os.replace 替换。
+
+    直接 truncate 原文件再写的写法在崩溃/断电瞬间会产生损坏的半截 JSON，
+    导致下次启动静默丢失格子位置与撤销历史。os.replace 在同分区上是原子的，
+    任何时刻磁盘上的正式文件要么是完整旧版、要么是完整新版。
+    """
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):          # 写入/替换失败残留的临时文件
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
 def save_config(config: Dict[str, Any]) -> None:
-    """保存配置到磁盘，目录不存在则自动创建。"""
+    """保存配置到磁盘，目录不存在则自动创建（原子写入，防损坏）。"""
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
+    data = json.dumps(config, ensure_ascii=False, indent=2)
+    _atomic_write(CONFIG_PATH, data)
 
 
 def load_history() -> List[dict]:
@@ -162,10 +182,10 @@ def load_history() -> List[dict]:
 
 
 def save_history(records: List[dict]) -> None:
-    """整体覆盖保存历史记录。"""
+    """整体覆盖保存历史记录（原子写入，防损坏）。"""
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(HISTORY_PATH, "w", encoding="utf-8") as f:
-        json.dump(records, f, ensure_ascii=False, indent=2)
+    data = json.dumps(records, ensure_ascii=False, indent=2)
+    _atomic_write(HISTORY_PATH, data)
 
 
 def append_records(new_records: List[dict]) -> None:

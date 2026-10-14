@@ -364,11 +364,22 @@ class AppContext:
             self.refresh_status("没有可剪切的条目")
 
     def handle_paste_files(self, widget: FileWidget):
-        """右键"粘贴"：把剪切板里的条目移动到本格子（复用拖入的移动与历史记录）。"""
+        """右键"粘贴"：把剪切板里的条目移动到本格子（复用拖入的移动与历史记录）。
+
+        被占用导致移动失败的条目保留在剪切板，可直接换个格子或稍后重新粘贴。
+        """
         paths, self.file_clipboard = self.file_clipboard, []
         if not paths:
             return
-        self.handle_drop(paths, widget)
+        failed = self.handle_drop(paths, widget) or []
+        remaining = [p for p in failed if os.path.exists(p)]
+        if remaining:
+            self.file_clipboard = remaining
+            names = "、".join(os.path.basename(p) for p in remaining[:3])
+            suffix = f" 等 {len(remaining)} 项" if len(remaining) > 3 else ""
+            self.refresh_status(
+                f"粘贴失败 {len(remaining)} 项（{names}{suffix}），"
+                "已保留在剪切板，可换个格子或稍后重试")
 
     def clipboard_count(self) -> int:
         """当前剪切板条目数（供右键菜单显示与可用状态）。"""
@@ -747,35 +758,38 @@ class AppContext:
 
     # ---------- 拖拽收纳 ----------
 
-    def handle_drop(self, paths: list, widget: FileWidget):
-        """把拖入格子的文件/文件夹移动到该格子对应的分类文件夹并记录历史。"""
+    def handle_drop(self, paths: list, widget: FileWidget) -> list:
+        """把拖入格子的文件/文件夹移动到该格子对应的分类文件夹并记录历史。
+
+        :returns: 移动失败的路径列表（全部成功时为空）。供"粘贴"保留失败项用。
+        历史记录每批只落盘一次（拖入 50 个文件 = 1 次写入，而不是 50 次）。
+        """
         batch = uuid.uuid4().hex[:12]
-        moved, failed = 0, 0
-        failed_names = []
+        now = datetime.now().isoformat(timespec="seconds")
+        records, failed = [], []
         for src in paths:
             if org.is_within(src, widget.folder):
                 continue                  # 从本格子拖回自身：静默忽略，不计失败
             try:
                 dst = org.move_into(src, widget.folder)
             except (OSError, shutil.Error, ValueError):
-                failed += 1
-                failed_names.append(os.path.basename(src))
+                failed.append(src)
                 continue
-            cfg.append_records([org.MoveRecord(
-                src=src, dst=dst, batch=batch,
-                time=datetime.now().isoformat(timespec="seconds"),
-            ).to_dict()])
-            moved += 1
-        if moved:
+            records.append(org.MoveRecord(
+                src=src, dst=dst, batch=batch, time=now,
+            ).to_dict())
+        if records:
+            cfg.append_records(records)   # 整批一次写入，避免逐文件重写历史
             widget.refresh()
         if failed:
-            names = "、".join(failed_names[:3])
-            extra = f" 等 {len(failed_names)} 项" if len(failed_names) > 3 else ""
+            names = "、".join(os.path.basename(p) for p in failed[:3])
+            extra = f" 等 {len(failed)} 项" if len(failed) > 3 else ""
             self.refresh_status(
-                f"收纳到「{widget.title}」：成功 {moved} 项，"
-                f"失败 {len(failed_names)} 项（{names}{extra}，可能被占用）")
-        elif moved:
-            self.refresh_status(f"已收纳 {moved} 项到「{widget.title}」")
+                f"收纳到「{widget.title}」：成功 {len(records)} 项，"
+                f"失败 {len(failed)} 项（{names}{extra}，可能被占用）")
+        elif records:
+            self.refresh_status(f"已收纳 {len(records)} 项到「{widget.title}」")
+        return failed
 
     def show_panel(self):
         """显示并激活控制面板。"""

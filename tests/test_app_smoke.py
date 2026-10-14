@@ -272,3 +272,73 @@ def test_cut_paste_between_grids(ctx):
     assert os.path.exists(moved)
     assert ctx.clipboard_count() == 0
     assert len(cfg.load_history()) == 1
+
+
+# ---------- v2.6.1 优化回归：批量写历史 / 粘贴保留失败项 / 根目录守卫 ----------
+
+def test_handle_drop_writes_history_once(ctx, monkeypatch):
+    """拖入多个文件只做一次历史落盘，而不是每个文件重写一遍历史文件。"""
+    calls = []
+    monkeypatch.setattr(cfg, "append_records",
+                        lambda records: calls.append(records))
+    doc = next(w for w in ctx.widgets if w.title == "文档")
+    base = os.path.dirname(ctx.config["storageRoot"])
+    srcs = []
+    for i in range(3):
+        src = os.path.join(base, f"批量{i}.txt")
+        with open(src, "w", encoding="utf-8") as f:
+            f.write("x")
+        srcs.append(src)
+
+    ctx.handle_drop(srcs, doc)
+
+    assert len(calls) == 1                        # 一次拖入 = 一次写入
+    assert len(calls[0]) == 3
+    assert os.path.isdir(os.path.join(ctx.config["storageRoot"], "文档"))
+
+
+def test_paste_failure_keeps_items_in_clipboard(ctx, monkeypatch):
+    """粘贴时被占用而移动失败的条目应保留在剪切板，成功项正常移动入库。"""
+    doc = next(w for w in ctx.widgets if w.title == "文档")
+    base = os.path.dirname(ctx.config["storageRoot"])
+    ok = os.path.join(base, "好文件.txt")
+    bad = os.path.join(base, "坏文件.txt")
+    for path, text in ((ok, "好"), (bad, "坏")):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    real_move_into = org.move_into
+
+    def flaky(src, folder):
+        if os.path.basename(src) == "坏文件.txt":
+            raise OSError("文件被占用")
+        return real_move_into(src, folder)
+
+    monkeypatch.setattr(org, "move_into", flaky)
+    ctx.file_clipboard = [ok, bad]
+
+    ctx.handle_paste_files(doc)
+
+    assert os.path.exists(
+        os.path.join(ctx.config["storageRoot"], "文档", "好文件.txt"))
+    assert not os.path.exists(
+        os.path.join(ctx.config["storageRoot"], "文档", "坏文件.txt"))
+    assert ctx.file_clipboard == [bad]            # 失败项保留，可重新粘贴
+    assert len(cfg.load_history()) == 1           # 只有成功项写历史
+
+
+def test_save_root_ignores_no_change(ctx, monkeypatch):
+    """收纳目录未改动时失焦不应写配置或全量重建格子（editingFinished 守卫）。"""
+    rebuild_calls = []
+    monkeypatch.setattr(ctx, "on_widgets_rebuild",
+                        lambda: rebuild_calls.append(1))
+
+    ctx.panel._save_root()                        # 文本与配置一致 → 无动作
+    assert rebuild_calls == []
+
+    new_root = os.path.join(os.path.dirname(ctx.config["storageRoot"]), "新库")
+    ctx.panel.root_edit.setText(new_root)
+    ctx.panel._save_root()
+
+    assert rebuild_calls == [1]                   # 真正改动才重建
+    assert cfg.load_config()["storageRoot"] == new_root

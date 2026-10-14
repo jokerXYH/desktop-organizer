@@ -293,8 +293,17 @@ class ControlPanel(QWidget):
             self._save_root()
 
     def _save_root(self):
-        """保存收纳根目录并重建格子。"""
-        self.ctx.config["storageRoot"] = self.root_edit.text().strip()
+        """保存收纳根目录并重建格子；值未变化时直接跳过。
+
+        editingFinished 在回车或"失焦"时都会触发，即使文本从未改动；
+        不做守卫的话，用户每点一下别的控件都会全量重建一次格子。
+        """
+        old_root = os.path.normcase(os.path.normpath(
+            str(self.ctx.config.get("storageRoot", ""))))
+        text = self.root_edit.text().strip()
+        if os.path.normcase(os.path.normpath(text)) == old_root:
+            return                       # 未修改：不写配置、不重建格子
+        self.ctx.config["storageRoot"] = text
         cfg.save_config(self.ctx.config)
         self.ctx.on_widgets_rebuild()
 
