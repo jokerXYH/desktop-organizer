@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""GUI 冒烟测试：offscreen 平台下构造格子窗口，验证刷新、空状态、拖出数据与锁定标签。"""
+"""GUI 冒烟测试：offscreen 平台下构造格子窗口，验证刷新、空状态、拖出数据与预览切换。"""
 import os
 import sys
 
@@ -9,9 +9,11 @@ import pytest  # noqa: E402
 from PySide6.QtCore import QSize, Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication, QListView  # noqa: E402
 
-from widgets import (FileWidget, MIN_WIDGET_H, MIN_WIDGET_W,  # noqa: E402
-                     SCALE_MAX, SCALE_MIN, SearchWidget, _icon_stats,
-                     _url_icon_file, get_file_icon, scale_geometry)
+from widgets import (COMPACT_ICON_PX, FileWidget, MIN_WIDGET_H,  # noqa: E402
+                     MIN_WIDGET_W, SCALE_MAX, SCALE_MIN, SearchWidget,
+                     _icon_stats, _url_icon_file, decode_thumbnail,
+                     get_file_icon, get_thumbnail_service, is_thumbnailable,
+                     scale_geometry)
 
 _APP = QApplication.instance() or QApplication(sys.argv)
 
@@ -69,23 +71,18 @@ def test_drag_out_mime_contains_file_urls(tmp_path):
     widget.close()
 
 
-def test_preview_switch_and_lock_label(tmp_path):
-    """预览切换应改变视图模式；锁定后数量标签带提示并回调持久化。"""
-    changes = []
-    widget = _make_widget(tmp_path, locked=True,
-                          on_lock_changed=lambda w, locked: changes.append(locked))
+def test_preview_switch_keeps_count_label(tmp_path):
+    """预览切换应改变视图模式，数量标签保持纯计数（不再有锁定后缀）。"""
+    widget = _make_widget(tmp_path)
     (tmp_path / "文档" / "a.txt").write_text("a", encoding="utf-8")
     widget.refresh()
 
-    assert "已锁定" in widget.count_label.text()
+    assert widget.count_label.text() == "1 项"
 
     widget.set_preview(False)
     assert widget.list_widget.viewMode() == QListView.ListMode
     widget.set_preview(True)
     assert widget.list_widget.viewMode() == QListView.IconMode
-
-    widget._set_locked(False)
-    assert changes == [False]
     assert "已锁定" not in widget.count_label.text()
     widget.close()
 
@@ -114,8 +111,11 @@ def test_widget_metrics_zoom_steps(tmp_path):
     widget._zoom(-1)                              # 缩小回 100%
     assert widget.list_widget.gridSize().height() == base["cell_h"]
 
-    widget._reset_scale()
-    assert widget.list_widget.gridSize().height() == base["cell_h"]
+    widget._zoom(-1)                              # 85%
+    widget._zoom(-1)                              # 落到最低档位 75%
+    assert widget.scale == SCALE_MIN
+    widget._zoom(-1)                              # 已到底：再缩小保持不变
+    assert widget.scale == SCALE_MIN
     widget.close()
 
 
@@ -135,7 +135,7 @@ def test_free_resize_and_persist_callback(tmp_path):
 
 
 def test_resize_edge_hit_testing(tmp_path):
-    """八方向拖拽热区判定（四边+四角）；锁定时不响应调整。"""
+    """八方向拖拽热区判定（四边+四角），格子内部区域不触发调整。"""
     from PySide6.QtCore import QPoint
     widget = _make_widget(tmp_path)
     w, h = widget.width(), widget.height()
@@ -148,8 +148,6 @@ def test_resize_edge_hit_testing(tmp_path):
     assert widget._edge_at(QPoint(w - 2, 2)) == "top-right"
     assert widget._edge_at(QPoint(2, h - 2)) == "bottom-left"
     assert widget._edge_at(QPoint(w - 2, h - 2)) == "bottom-right"
-    widget._set_locked(True)
-    assert widget._edge_at(QPoint(w - 2, h - 2)) is None
     widget.close()
 
 
@@ -186,22 +184,53 @@ def test_resize_geometry_all_edges(tmp_path):
     widget.close()
 
 
+def test_resize_snap_keeps_opposite_edge(tmp_path):
+    """吸附只改"被拖的那条边"：拖下缘 top 不动、拖右缘 left 不动。
+
+    回归点：旧实现把下缘吸附写成 top = edge_y - height、右缘写成
+    left = edge_x - width，于是用户拖下边时上边也会跟着动，观感很反常。
+    """
+    from PySide6.QtCore import QPoint, QRect
+    widget = _make_widget(tmp_path)
+    start = (100, 100, 270, 360)
+
+    # 拖下缘：bottom 靠近 peer 上缘(300) → 只改 height，top 必须保持 100
+    peer_below = QRect(600, 300, 270, 360)
+    geom, guides = widget._resize_geometry(
+        "bottom", start, QPoint(0, -156), [peer_below])
+    assert geom[1] == 100                 # 对边（上缘）没有被带动
+    assert geom[3] == 200                 # 下缘吸附到 300 → 300 - 100
+    assert len(guides) == 1
+
+    # 拖右缘：right 靠近 peer 左缘(400) → 只改 width，left 必须保持 100
+    peer_right = QRect(400, 600, 270, 360)
+    geom, guides = widget._resize_geometry(
+        "right", start, QPoint(34, 0), [peer_right])
+    assert geom[0] == 100                 # 对边（左缘）没有被带动
+    assert geom[2] == 300                 # 右缘吸附到 400 → 400 - 100
+    assert len(guides) == 1
+    widget.close()
+
+
 def test_search_widget_basic(tmp_path):
-    """搜索格子：输入关键词后展示结果、空关键词显示提示。"""
+    """搜索条：平时只有搜索框的高度；输入关键词后向下展开显示结果。"""
     results = [("文档", str(tmp_path / "报告.docx"))]
     widget = SearchWidget(
         lambda kw: results if "bg" in kw.lower() else [],
         "搜索", str(tmp_path), None)
 
     widget.refresh()
-    assert widget.list_widget.count() == 1        # 空关键词：提示条目
-    assert "输入关键词" in widget.list_widget.item(0).text()
+    # 空关键词：不显示任何结果条目，结果区收起 → 窗口只剩"一个搜索框"的高度
+    assert widget.list_widget.count() == 0
+    assert widget.list_widget.isHidden()
+    bar_height = widget.height()
 
     widget.search_edit.setText("bg")
     widget._run_search()
     assert widget.list_widget.count() == 1
     assert widget.list_widget.item(0).data(Qt.UserRole).endswith("报告.docx")
     assert "1 项" in widget.count_label.text()
+    assert widget.height() > bar_height           # 有结果：窗口向下展开
     widget.close()
 
 
@@ -219,20 +248,21 @@ def test_context_menu_items(tmp_path):
     assert "打开" in texts
     assert any("复制路径" in t for t in texts)
     assert any("剪切" in t for t in texts)
+    assert any("重命名（F2）" in t for t in texts)   # 条目重命名入口
     assert any("删除到回收站" in t for t in texts)
     assert any("粘贴" in t for t in texts)
     assert "预览方式" in texts                    # 子菜单
-    assert "尺寸调整" in texts                    # 子菜单
-    assert "锁定位置" in texts
+    assert "尺寸调整" not in texts                # 已移除：尺寸请用拖拽边缘/Ctrl+滚轮
+    assert "锁定位置" not in texts                # 已移除：不再提供位置锁定
     assert any("重命名格子" in t for t in texts)
     assert any("新建格子" in t for t in texts)
     assert any("映射文件夹" in t for t in texts)
     assert any("删除此格子" in t for t in texts)
     assert "刷新" in texts
 
-    # 内置分类：重命名不可用；自定义格子：重命名可用
+    # 内置分类改名只改显示名，同样可用（搜索条才禁止重命名）
     rename_action = next(a for a in menu.actions() if "重命名格子" in a.text())
-    assert not rename_action.isEnabled()
+    assert rename_action.isEnabled()
     menu.deleteLater()
 
     custom = _make_widget(tmp_path, title="自定义格")
@@ -295,6 +325,58 @@ def test_get_file_icon_returns_nonnull(tmp_path):
     assert icon is not None and not icon.isNull()
 
 
+# ---------- 图片缩略图 ----------
+
+def test_is_thumbnailable_filters(tmp_path):
+    """缩略图准入：图片扩展名通过，文本/缺失文件不通过。"""
+    img = tmp_path / "a.jpg"
+    img.write_bytes(b"x" * 10)
+    assert is_thumbnailable(str(img))
+
+    txt = tmp_path / "a.txt"
+    txt.write_text("x", encoding="utf-8")
+    assert not is_thumbnailable(str(txt))
+    assert not is_thumbnailable(str(tmp_path / "missing.png"))
+
+
+def test_decode_thumbnail_bounds_size(tmp_path):
+    """解码缩略图：结果非空，且长边不超过请求尺寸。"""
+    from PySide6.QtGui import QColor, QImage
+
+    src = tmp_path / "big.png"
+    big = QImage(200, 100, QImage.Format_RGB32)
+    big.fill(QColor(120, 40, 200))
+    assert big.save(str(src), "PNG")
+
+    thumb = decode_thumbnail(str(src), 40)
+    assert not thumb.isNull()
+    assert max(thumb.width(), thumb.height()) <= 40
+
+
+def test_set_item_icon_prefers_cached_thumbnail(tmp_path):
+    """命中缩略图缓存时，图片条目直接用缩略图，而不是系统图标。"""
+    from PySide6.QtGui import QColor, QImage
+    from PySide6.QtWidgets import QListWidgetItem
+
+    widget = _make_widget(tmp_path)
+    img_path = tmp_path / "文档" / "photo.png"
+    thumb = QImage(30, 12, QImage.Format_ARGB32)
+    thumb.fill(QColor(20, 140, 220))
+    assert thumb.save(str(img_path), "PNG")
+
+    # 预置缓存：绕开后台线程时序，稳定验证"缓存命中即用缩略图"的分支
+    size = widget._icon_px
+    key = (str(img_path), os.path.getmtime(str(img_path)), size)
+    get_thumbnail_service()._cache[key] = thumb
+
+    item = QListWidgetItem("photo.png")
+    widget._set_item_icon(item, str(img_path))
+
+    pix = item.icon().pixmap(QSize(64, 64))
+    assert pix.size() == QSize(30, 12)     # 尺寸与预置缩略图一致：证明未走系统图标
+    widget.close()
+
+
 # ---------- 拖动吸附与对齐指示线 ----------
 
 def test_apply_snap_aligns_and_returns_guides(tmp_path):
@@ -354,13 +436,72 @@ def test_drag_pipeline_snaps_and_shows_guides(tmp_path):
 # ---------- 紧凑列表：小图标 + 行距 ----------
 
 def test_compact_mode_small_icons_and_roomier_rows(tmp_path):
-    """紧凑列表：左侧 16px 小图标、行距更松弛。"""
+    """紧凑列表：左侧小缩略图（24px）、行距更松弛。"""
     widget = _make_widget(tmp_path)
     (tmp_path / "文档" / "a.txt").write_text("a", encoding="utf-8")
     widget.set_preview(False)
 
-    assert widget.list_widget.iconSize() == QSize(16, 16)
+    assert widget.list_widget.iconSize() == QSize(COMPACT_ICON_PX, COMPACT_ICON_PX)
     assert "padding" in widget.list_widget.styleSheet()
     item = widget.list_widget.item(0)
     assert item is not None and not item.icon().isNull()
     widget.close()
+
+
+# ---------- Delete 键删除 / 拖出即移走 ----------
+
+def test_delete_key_sends_selected_paths(tmp_path):
+    """Delete 键：把选中条目的真实路径交给删除回调（外层再执行删除到回收站）。"""
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+
+    widget = _make_widget(tmp_path)
+    (tmp_path / "文档" / "a.txt").write_text("a", encoding="utf-8")
+    (tmp_path / "文档" / "b.txt").write_text("b", encoding="utf-8")
+    widget.refresh()
+
+    received = []
+    widget.list_widget.delete_cb = received.append
+    widget.list_widget.setCurrentItem(widget.list_widget.item(0))
+    QApplication.sendEvent(
+        widget.list_widget,
+        QKeyEvent(QEvent.KeyPress, Qt.Key_Delete, Qt.NoModifier))
+
+    assert received == [[str(tmp_path / "文档" / "a.txt")]]
+    widget.close()
+
+
+def test_delete_key_ignored_without_selection(tmp_path):
+    """空状态（只有提示条目）时按 Delete：没有真实路径，不触发删除回调。"""
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+
+    widget = _make_widget(tmp_path)
+    widget.refresh()                                  # 只有"拖入"与"右键"两条提示
+
+    received = []
+    widget.list_widget.delete_cb = received.append
+    widget.list_widget.setCurrentItem(widget.list_widget.item(0))
+    QApplication.sendEvent(
+        widget.list_widget,
+        QKeyEvent(QEvent.KeyPress, Qt.Key_Delete, Qt.NoModifier))
+
+    assert received == []
+    widget.close()
+
+
+def test_delete_callback_wired_to_delete_to_recycle(tmp_path):
+    """格子默认把 Delete 键接到与右键"删除到回收站"同一个入口。"""
+    widget = _make_widget(tmp_path)
+    assert widget.list_widget.delete_cb == widget._delete_paths
+    widget.close()
+
+
+def test_drag_out_declares_move_only():
+    """拖出只声明"移动"，跨盘（D: 收纳库 -> C: 桌面）才会真正移走源文件。
+
+    若沿用系统默认的"复制|移动"，资源管理器对跨盘拖放按复制处理，
+    源文件会留在收纳库里，格子上看起来"拖出来了却没少"。
+    """
+    from widgets import DRAG_ACTION
+    assert DRAG_ACTION == Qt.MoveAction

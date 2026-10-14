@@ -107,19 +107,24 @@ def test_organize_keeps_folders_when_disabled(tmp_path):
     assert os.path.isdir(str(desktop / "我的文件夹"))
 
 
-def test_organize_folder_collision_renames(tmp_path):
-    """同名文件夹两次整理应自动加后缀而不是覆盖。"""
+def test_organize_folder_collision_merges(tmp_path):
+    """同名文件夹两次整理应"合并"而不是生成 "资料 (2)" 副本。
+
+    旧行为是 unique_path 改名（收纳库里出现"莫名多一份同名文件夹"），
+    现在改为并入已有同名文件夹；空文件夹并入后源目录被删除。
+    """
     desktop = tmp_path / "desktop"
     storage = tmp_path / "storage"
     desktop.mkdir()
     os.mkdir(str(desktop / "资料"))
-    org.organize_desktop(str(desktop), str(storage))
-    os.mkdir(str(desktop / "资料"))
+    org.organize_desktop(str(desktop), str(storage))   # 第一次：整体收进收纳库
+    os.mkdir(str(desktop / "资料"))                    # 桌面又出现同名文件夹
 
     org.organize_desktop(str(desktop), str(storage))
 
     assert os.path.isdir(str(storage / org.FOLDER_CATEGORY / "资料"))
-    assert os.path.isdir(str(storage / org.FOLDER_CATEGORY / "资料 (2)"))
+    assert not os.path.isdir(str(storage / org.FOLDER_CATEGORY / "资料 (2)"))
+    assert not os.path.isdir(str(desktop / "资料"))    # 已并入，桌面不留空壳
 
 
 def test_organize_keeps_shortcuts_by_default(tmp_path):
@@ -402,3 +407,128 @@ def test_move_to_recycle_bin(tmp_path):
 def test_move_to_recycle_bin_missing_file(tmp_path):
     """删除不存在的路径应返回 False 而不是崩溃或弹窗。"""
     assert org.move_to_recycle_bin(str(tmp_path / "ghost.txt")) is False
+
+
+# ---------- is_within 收纳库自我保护 ----------
+
+@pytest.mark.skipif(os.name != "nt", reason="大小写不敏感仅 Windows 文件系统")
+def test_is_within_case_insensitive(tmp_path):
+    """收纳库自我保护必须大小写不敏感：仅比小写敏感字符串会漏判。"""
+    root = tmp_path / "Storage"
+    inner = root / "文档"
+    inner.mkdir(parents=True)
+
+    assert org.is_within(str(inner), str(root))            # 完全一致
+    assert org.is_within(str(inner), str(root).upper())    # 仅大小写不同
+    assert org.is_within(str(root), str(root).upper())     # 根自身
+    assert not org.is_within(str(tmp_path / "Other"), str(root))
+
+
+# ---------- organize_desktop 返回值：跳过名单 ----------
+
+def test_organize_reports_skipped_by_switches(tmp_path):
+    """return_failed=True 时须区分"失败"与"因开关关闭而有意跳过"。
+
+    旧实现只返回失败名单，自动整理把跳过项当成"已成功收纳"，
+    于是在用户之后打开开关时永久不再收纳它们。
+    """
+    desktop = tmp_path / "desktop"
+    storage = tmp_path / "storage"
+    desktop.mkdir()
+    (desktop / "相册").mkdir()
+    _touch(str(desktop / "微信.lnk"))
+    _touch(str(desktop / "报告.pdf"))
+
+    records, failed, skipped = org.organize_desktop(
+        str(desktop), str(storage),
+        include_folders=False, include_shortcuts=False, return_failed=True)
+
+    assert sorted(skipped) == sorted(["相册", "微信.lnk"])
+    assert failed == []
+    assert len(records) == 1
+    assert os.path.exists(str(storage / "文档" / "报告.pdf"))
+    assert (desktop / "相册").is_dir()                 # 有意留在桌面，未移动
+    assert os.path.exists(str(desktop / "微信.lnk"))
+
+
+def test_organize_skipped_empty_when_switches_on(tmp_path):
+    """开关全部打开时没有跳过项，skipped 为空（不影响原有行为）。"""
+    desktop = tmp_path / "desktop"
+    storage = tmp_path / "storage"
+    desktop.mkdir()
+    (desktop / "相册").mkdir()
+    _touch(str(desktop / "微信.lnk"))
+
+    records, failed, skipped = org.organize_desktop(
+        str(desktop), str(storage),
+        include_folders=True, include_shortcuts=True, return_failed=True)
+
+    assert skipped == []
+    assert failed == []
+    assert len(records) == 2
+
+
+# ---------- rename_entry 就地重命名（文件/文件夹） ----------
+
+def test_rename_entry_file_and_folder(tmp_path):
+    """重命名文件与文件夹：只改名称、原地不动，返回新的完整路径。"""
+    src = tmp_path / "旧名.txt"
+    _touch(str(src))
+
+    new_path = org.rename_entry(str(src), "新名.txt")
+    assert new_path == str(tmp_path / "新名.txt")   # 父目录不变
+    assert not src.exists() and os.path.exists(new_path)
+
+    folder = tmp_path / "旧文件夹"
+    folder.mkdir()
+    _touch(str(folder / "a.txt"))
+
+    new_folder = org.rename_entry(str(folder), "新文件夹")
+    assert new_folder == str(tmp_path / "新文件夹")
+    assert os.path.exists(os.path.join(new_folder, "a.txt"))  # 内容随之迁移
+
+
+def test_rename_entry_rejects_existing_and_missing(tmp_path):
+    """目标已存在不允许覆盖；源不存在报 FileNotFoundError。"""
+    _touch(str(tmp_path / "a.txt"))
+    _touch(str(tmp_path / "b.txt"))
+
+    with pytest.raises(ValueError, match="已存在"):
+        org.rename_entry(str(tmp_path / "a.txt"), "b.txt")
+    assert os.path.exists(str(tmp_path / "a.txt"))   # 失败后源文件仍在
+
+    with pytest.raises(FileNotFoundError):
+        org.rename_entry(str(tmp_path / "不存在.txt"), "x.txt")
+
+
+@pytest.mark.parametrize("bad_name, tip", [
+    ("", "不能为空"),
+    ("   ", "不能为空"),
+    ("a:b", "不能包含"),
+    ("a/b", "不能包含"),
+    ("结尾.", "句点"),
+    ("..", "无效"),
+])
+def test_validate_entry_name_rejects_bad(tmp_path, bad_name, tip):
+    """非法名称返回错误提示（空、非法字符、句点结尾、路径保留名）。"""
+    assert tip in org.validate_entry_name(bad_name)
+    with pytest.raises(ValueError):
+        org.rename_entry(str(tmp_path / "x.txt"), bad_name)
+
+
+def test_validate_entry_name_allows_common_names():
+    """常规名称（含中文、空格、括号）应判为合法。"""
+    assert org.validate_entry_name("会议纪要 2026(终版).docx") == ""
+
+
+def test_rename_entry_readonly_file(tmp_path):
+    """只读文件也能改名：改名只动目录项，不写文件内容。"""
+    src = tmp_path / "只读.txt"
+    _touch(str(src))
+    os.chmod(str(src), 0o444)                 # 置为只读
+    try:
+        new_path = org.rename_entry(str(src), "改名后.txt")
+        assert os.path.exists(new_path)
+    finally:
+        # 还原可写，避免临时目录清理失败
+        os.chmod(new_path if os.path.exists(new_path) else str(src), 0o666)

@@ -10,14 +10,16 @@ import ctypes
 import os
 import shutil
 import sys
+import threading
 import time
 import uuid
 from ctypes import wintypes
 from datetime import datetime
 
 from PySide6.QtCore import (QAbstractNativeEventFilter, QFileSystemWatcher,
-                            QPoint, QRect, QTimer)
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
+                            QPoint, QRect, Qt, QTimer)
+from PySide6.QtGui import (QAction, QColor, QFont, QIcon, QLinearGradient,
+                           QPainter, QPixmap)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (QApplication, QFileDialog, QInputDialog,
                                QMenu, QMessageBox, QSystemTrayIcon)
@@ -25,6 +27,7 @@ from PySide6.QtWidgets import (QApplication, QFileDialog, QInputDialog,
 import autostart
 import config as cfg
 import organizer as org
+import shortcut
 from control_panel import ControlPanel
 from search_service import SearchService
 from widgets import (BUILTIN_GRID_NAMES, SEARCH_GRID_TITLE, FileWidget,
@@ -36,8 +39,9 @@ MOD_NOREPEAT = 0x4000     # 不重复触发标志
 VK_F7, VK_F8, VK_F9 = 0x76, 0x77, 0x78                     # F7/F8/F9 虚拟键码
 HOTKEY_F7, HOTKEY_F8, HOTKEY_F9 = 0xB00B, 0xB00C, 0xB00D   # 热键注册 ID
 
-# 本入口脚本绝对路径（写注册表自启项用）
-SCRIPT_PATH = os.path.abspath(__file__)
+# 本入口脚本绝对路径（写注册表自启项用）；打包成 exe 后由 exe 自身启动，
+# 此时 __file__ 是临时解包目录（退出即删），写入自启项会指向不存在的脚本
+SCRIPT_PATH = "" if getattr(sys, "frozen", False) else os.path.abspath(__file__)
 
 # 文件系统事件到达后的防抖刷新间隔（毫秒），合并突发改动避免频繁刷列表
 REFRESH_DEBOUNCE_MS = 400
@@ -49,32 +53,44 @@ AUTO_MAX_CONFIRM_ROUNDS = 45   # 条目持续变化的观察轮数上限（约 9
 AUTO_RETRY_MS = 30000          # 移动失败（被占用）后的重试间隔（毫秒）
 AUTO_MAX_ATTEMPTS = 5          # 同一条目的最大自动重试次数
 AUTO_DUP_GUARD_S = 900         # 同名条目重复出现的保护窗口（秒，15 分钟）
+AUTO_DIR_SCAN_CAP = 500        # 文件夹稳定性快照的递归条目数上限（防超大目录拖慢确认轮）
 
 # 单实例互斥：本地套接字服务名（Windows 上对应命名管道）
 SINGLE_INSTANCE_KEY = "MyDeskOrganizer.SingleInstance"
 
-# 全局暗色 QSS：右键菜单、工具提示与弹窗对话框跟随应用主题
+# 全局玻璃拟态 QSS：右键菜单、工具提示与弹窗对话框跟随应用的暗色玻璃主题
 APP_QSS = """
-QMenu{background:#26282e;color:#e8eaed;border:1px solid #3a3d46;
-      border-radius:8px;padding:4px;}
-QMenu::item{padding:5px 18px;border-radius:5px;}
-QMenu::item:selected{background:rgba(76,194,255,70);}
-QMenu::separator{height:1px;background:#3a3d46;margin:4px 6px;}
-QToolTip{background:#26282e;color:#e8eaed;border:1px solid #3a3d46;
-         border-radius:6px;padding:4px;}
-QDialog,QMessageBox,QInputDialog{background:#1e2025;color:#e8eaed;}
+QMenu{background:#1c1f26;color:#eceef1;border:1px solid rgba(255,255,255,38);
+      border-radius:10px;padding:6px;}
+QMenu::item{padding:6px 20px;border-radius:7px;}
+QMenu::item:selected{background:rgba(255,255,255,60);color:#ffffff;}
+QMenu::separator{height:1px;background:rgba(255,255,255,26);margin:5px 8px;}
+QToolTip{background:#1c1f26;color:#eceef1;border:1px solid rgba(255,255,255,38);
+         border-radius:8px;padding:5px 8px;}
+QDialog,QMessageBox,QInputDialog{background:#17181b;color:#eceef1;}
 QDialog QLabel,QMessageBox QLabel,QInputDialog QLabel{
-      color:#e8eaed;background:transparent;}
-QDialog QPushButton,QMessageBox QPushButton{background:#2a2d34;
-      border:1px solid #3a3d46;border-radius:8px;padding:5px 16px;color:#e8eaed;}
+      color:#eceef1;background:transparent;}
+QDialog QPushButton,QMessageBox QPushButton{background:rgba(255,255,255,14);
+      border:1px solid rgba(255,255,255,30);border-radius:9px;
+      padding:6px 18px;color:#eceef1;}
 QDialog QPushButton:hover,QMessageBox QPushButton:hover{
-      background:#33373f;border-color:#4cc2ff;}
-QDialog QPushButton:pressed{background:#23262c;}
-QDialog QLineEdit,QInputDialog QLineEdit{background:#26282e;
-      border:1px solid #3a3d46;border-radius:8px;padding:5px 8px;color:#e8eaed;
-      selection-background-color:rgba(76,194,255,90);}
-QDialog QLineEdit:focus{border-color:#4cc2ff;}
+      background:rgba(255,255,255,26);border-color:rgba(255,255,255,150);}
+QDialog QPushButton:pressed{background:rgba(255,255,255,8);}
+QDialog QLineEdit,QInputDialog QLineEdit{background:rgba(255,255,255,10);
+      border:1px solid rgba(255,255,255,28);border-radius:9px;
+      padding:6px 10px;color:#eceef1;
+      selection-background-color:rgba(255,255,255,70);}
+QDialog QLineEdit:focus{border-color:rgba(255,255,255,150);}
 """
+
+
+def _norm_dir(path) -> str:
+    """目录路径归一化键：绝对化 + 大小写归一（Windows 路径不敏感）。
+
+    监听回调拿到的路径与格子记录的用户路径可能大小写/尾分隔符不同，
+    两侧必须用同一把"尺子"归一，否则比对不上导致漏刷新（见 _refresh_pending）。
+    """
+    return os.path.normcase(os.path.abspath(str(path or "")))
 
 
 class GlobalHotkeyFilter(QAbstractNativeEventFilter):
@@ -108,14 +124,21 @@ def notify_running_instance() -> bool:
 
 
 def make_tray_icon() -> QIcon:
-    """程序托盘图标：程序化绘制一个圆角方块，避免依赖外部资源文件。"""
+    """程序托盘图标：程序化绘制一个玻璃感圆角方块，避免依赖外部资源文件。"""
     pixmap = QPixmap(64, 64)
     pixmap.fill(QColor(0, 0, 0, 0))
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.Antialiasing)
-    painter.setBrush(QColor(76, 194, 255))          # 主题蓝
+    # 主体：上下渐变（上亮下深），比纯色块更有体积感
+    gradient = QLinearGradient(0, 4, 0, 60)
+    gradient.setColorAt(0.0, QColor(108, 214, 255))
+    gradient.setColorAt(1.0, QColor(48, 150, 214))
+    painter.setBrush(gradient)
     painter.setPen(QColor(0, 0, 0, 0))
-    painter.drawRoundedRect(4, 4, 56, 56, 14, 14)   # 圆角底
+    painter.drawRoundedRect(4, 4, 56, 56, 16, 16)      # 圆角底
+    painter.setBrush(Qt.NoBrush)
+    painter.setPen(QColor(255, 255, 255, 90))          # 内高光描边：玻璃边缘反光
+    painter.drawRoundedRect(5, 5, 54, 54, 15, 15)
     painter.setPen(QColor(255, 255, 255))
     painter.setFont(QFont("Microsoft YaHei UI", 26, QFont.Bold))
     painter.drawText(pixmap.rect(), 132, "分")       # 132 = 水平垂直居中
@@ -129,11 +152,15 @@ class AppContext:
     def __init__(self):
         self.config = cfg.load_config()
         self.widgets: list = []
+        # 路径映射快照锁：搜索在后台线程读 gridPaths，主线程可能同时在增删映射，
+        # 直接迭代同一个 dict 会抛 "dictionary changed size during iteration"，
+        # 被后台线程的宽 except 吞成"空结果"。用锁保护这一次浅拷贝。
+        self._grid_lock = threading.Lock()
         # 搜索后台服务：面板与搜索格子共享，全库遍历/拼音在后台线程执行
         # （必须在 ControlPanel 之前创建：面板构造时会连接其信号）
         self.search_service = SearchService(
             lambda: self.config.get("storageRoot", ""),
-            lambda: list(self.config.get("gridPaths", {}).items()))
+            self._snapshot_grid_dirs)
         self.panel = ControlPanel(self)
         self.tray = None
         self.act_game_mode = None    # 托盘"游戏模式"菜单项（供状态同步）
@@ -173,6 +200,15 @@ class AppContext:
 
     # ---------- 格子管理 ----------
 
+    def _snapshot_grid_dirs(self) -> list:
+        """线程安全地返回路径映射快照 [(分类名, 目录), ...]。
+
+        供搜索后台线程调用：在锁内做一次浅拷贝，避免与主线程的增删映射
+        并发迭代同一个 dict（否则抛 RuntimeError 被吞成"空搜索"）。
+        """
+        with self._grid_lock:
+            return list(self.config.get("gridPaths", {}).items())
+
     def ensure_storage_dirs(self):
         """确保收纳根目录及各分类子目录存在（路径映射的格子除外）。"""
         root = self.config["storageRoot"]
@@ -198,10 +234,11 @@ class AppContext:
         scales = self.config.get("widgetScales", {})
         previews = self.config.get("widgetPreviews", {})
         mapped = self.config.get("gridPaths", {})
-        locked = self.config.get("lockedWidgets", [])
+        titles = self.config.get("gridTitles", {})   # 显示名记忆：{分类键: 显示名}
         need_save_default = False         # 是否有格子的位置需要写回配置
         for name in self.config.get("categories", []):
             folder = mapped.get(name) or os.path.join(root, name)
+            display = titles.get(name, name)   # 内置分类改名后：键不变，只换显示名
             try:
                 metrics = float(scales.get(name, 1.0))
             except (TypeError, ValueError):
@@ -209,12 +246,10 @@ class AppContext:
             preview = bool(previews.get(
                 name, self.config.get("previewIcons", True)))
             widget = FileWidget(
-                name, folder, self.handle_drop,
+                display, folder, self.handle_drop,
                 on_position_changed=self.handle_position_changed,
                 on_preview_changed=self.handle_preview_changed,
                 preview_icons=preview,
-                locked=name in locked,
-                on_lock_changed=self.handle_lock_changed,
                 snap_provider=self.widget_rects,
                 on_rename_grid=self.handle_rename_grid_request,
                 on_delete_grid=self.handle_delete_grid_request,
@@ -228,7 +263,8 @@ class AppContext:
                 on_paste_files=self.handle_paste_files,
                 clipboard_count=self.clipboard_count,
                 guide_show=self.show_guides,
-                guide_hide=self.hide_guides)
+                guide_hide=self.hide_guides,
+                grid_key=name)
             saved = cfg.parse_position(positions.get(name, ""))
             if saved and self._position_visible(saved[0], saved[1],
                                                 widget.width(), widget.height()):
@@ -246,7 +282,7 @@ class AppContext:
             self.widgets.append(widget)
             y += widget.height() + 16
 
-        # 桌面搜索格子：常驻桌面、可删除；位置/尺寸等记忆键名固定为“搜索”
+        # 桌面搜索条：扁平形态（只有搜索框高度）、常驻桌面、可删除；位置记忆键名固定为"搜索"
         if self.config.get("searchGrid", False):
             name = SEARCH_GRID_TITLE
             try:
@@ -257,17 +293,10 @@ class AppContext:
                 self.search_all, name, root, None,
                 search_service=self.search_service,
                 on_position_changed=self.handle_position_changed,
-                on_preview_changed=self.handle_preview_changed,
-                preview_icons=bool(previews.get(
-                    name, self.config.get("previewIcons", True))),
-                locked=name in locked,
-                on_lock_changed=self.handle_lock_changed,
                 snap_provider=self.widget_rects,
                 on_delete_grid=self.handle_delete_grid_request,
-                size=cfg.parse_position(sizes.get(name, "")),
                 metrics_scale=search_metrics,
                 on_zoom_changed=self.handle_zoom_changed,
-                on_size_changed=self.handle_size_changed,
                 guide_show=self.show_guides,
                 guide_hide=self.hide_guides)
             saved = cfg.parse_position(positions.get(name, ""))
@@ -308,7 +337,7 @@ class AppContext:
         for w in self.widgets:
             if w.title == SEARCH_GRID_TITLE:
                 continue
-            folder_norm = os.path.normcase(os.path.abspath(str(w.folder or "")))
+            folder_norm = _norm_dir(w.folder)
             if folder_norm in dirs:
                 w.refresh()
         search = next((w for w in self.widgets
@@ -348,14 +377,14 @@ class AppContext:
     def handle_position_changed(self, widget: FileWidget):
         """格子拖动停止（防抖后）：把新位置写入配置并持久化。"""
         positions = self.config.setdefault("widgetPositions", {})
-        positions[widget.title] = cfg.format_position(widget.x(), widget.y())
+        positions[widget.grid_key] = cfg.format_position(widget.x(), widget.y())
         cfg.save_config(self.config)
 
     def save_all_positions(self):
         """退出或首次布局时保存全部格子位置。"""
         positions = self.config.setdefault("widgetPositions", {})
         for w in self.widgets:
-            positions[w.title] = cfg.format_position(w.x(), w.y())
+            positions[w.grid_key] = cfg.format_position(w.x(), w.y())
         self.config["panelGeometry"] = cfg.format_geometry(
             self.panel.x(), self.panel.y(),
             self.panel.width(), self.panel.height())
@@ -386,29 +415,21 @@ class AppContext:
         if self._guide_overlay is not None:
             self._guide_overlay.hide_lines()
 
-    def handle_lock_changed(self, widget: FileWidget, locked: bool):
-        """格子切换位置锁定后写入配置持久化。"""
-        locked_list = self.config.setdefault("lockedWidgets", [])
-        if locked and widget.title not in locked_list:
-            locked_list.append(widget.title)
-        elif not locked and widget.title in locked_list:
-            locked_list.remove(widget.title)
-        cfg.save_config(self.config)
-
     # ---------- 尺寸缩放 ----------
 
     def handle_zoom_changed(self, widget: FileWidget, scale: float):
-        """图标/列宽缩放变化（Ctrl+滚轮/右键菜单）后写入配置持久化。"""
+        """图标/列宽缩放变化（Ctrl+滚轮）后写入配置持久化。"""
         scales = self.config.setdefault("widgetScales", {})
-        scales[widget.title] = round(float(scale), 4)
+        scales[widget.grid_key] = round(float(scale), 4)
         cfg.save_config(self.config)
         self.refresh_status(
             f"「{widget.title}」图标大小已调整为 {int(round(scale * 100))}%")
 
     def handle_size_changed(self, widget: FileWidget):
-        """窗口宽高变化（拖拽调整/恢复默认）后写入配置持久化。"""
+        """窗口宽高变化（拖拽边缘调整）后写入配置持久化。"""
         sizes = self.config.setdefault("widgetSizes", {})
-        sizes[widget.title] = cfg.format_position(widget.width(), widget.height())
+        sizes[widget.grid_key] = cfg.format_position(widget.width(),
+                                                     widget.height())
         cfg.save_config(self.config)
         self.refresh_status(
             f"「{widget.title}」窗口大小已调整为 {widget.width()}×{widget.height()}")
@@ -474,7 +495,8 @@ class AppContext:
         """新建格子：加入分类列表并重建；folder 给定时为路径映射（不建新文件夹）。"""
         self.config.setdefault("categories", []).append(name)
         if folder is not None:
-            self.config.setdefault("gridPaths", {})[name] = folder
+            with self._grid_lock:      # 与搜索后台线程的快照读取互斥
+                self.config.setdefault("gridPaths", {})[name] = folder
         cfg.save_config(self.config)
         self.panel.refresh_category_checks()
         self.rebuild_widgets()
@@ -490,7 +512,8 @@ class AppContext:
             "格子名称（会在收纳库中创建同名文件夹）：")
         if not ok:
             return
-        error = cfg.validate_grid_name(name, self.config.get("categories", []))
+        error = cfg.validate_grid_name(
+            name, self.config.get("categories", []) + [SEARCH_GRID_TITLE])
         if error:
             QMessageBox.warning(self.panel, "无法新建", error)
             return
@@ -517,7 +540,8 @@ class AppContext:
             self.panel, "映射文件夹", "格子名称：", text=default_name)
         if not ok:
             return
-        error = cfg.validate_grid_name(name, self.config.get("categories", []))
+        error = cfg.validate_grid_name(
+            name, self.config.get("categories", []) + [SEARCH_GRID_TITLE])
         if error:
             QMessageBox.warning(self.panel, "无法映射", error)
             return
@@ -528,21 +552,35 @@ class AppContext:
         self.map_folder_interactive()
 
     def rename_grid(self, old_name: str, new_name: str) -> str:
-        """重命名自定义格子：同步文件夹（仅收纳库内）、各类记忆与撤销历史。
+        """重命名格子：内置分类只改显示名，自定义格子改名并同步文件夹与历史。
 
         成功返回空字符串，失败返回错误提示（不抛异常，便于 UI 直接展示）。
-        路径映射的格子只改显示名称，映射的文件夹不做改动。
+
+        为什么内置分类不能改文件夹/分类键：`classify()` 按扩展名只会返回
+        「文档/图片/…/其他」这些固定名字，自动整理据此定位目标文件夹。若把
+        「文档」的键改成别的名字，自动整理就会找不到格子而停止收纳文档。
+        因此内置分类的键与文件夹保持不变，只在 gridTitles 里改显示名。
         """
-        existing = [n for n in self.config.get("categories", []) if n != old_name]
+        titles = self.config.setdefault("gridTitles", {})
+        # 用户可见名字是"显示名"，重名判断必须按显示名来（键可能与显示名不同）；
+        # "搜索"是搜索条的保留名，不允许被占用
+        existing = [titles.get(n, n) for n in self.config.get("categories", [])
+                    if n != old_name] + [SEARCH_GRID_TITLE]
         error = cfg.validate_grid_name(new_name, existing)
         if error:
             return error
+        root = self.config["storageRoot"]
+        if old_name in BUILTIN_GRID_NAMES:
+            titles[old_name] = new_name       # 只改显示名：键/文件夹/记忆/历史全不动
+            cfg.save_config(self.config)
+            self.rebuild_widgets()
+            self.refresh_status(f"格子「{old_name}」已重命名为「{new_name}」")
+            return ""
         mapping = self.config.get("gridPaths", {})
         mapped = old_name in mapping
-        root = self.config["storageRoot"]
         old_dir = os.path.join(root, old_name)
         new_dir = os.path.join(root, new_name)
-        if not mapped:
+        if not mapped:                        # 非映射的自定义格子：文件夹跟着改名
             if os.path.isdir(new_dir):
                 return f"收纳库中已存在同名文件夹「{new_name}」"
             if os.path.isdir(old_dir):
@@ -554,7 +592,8 @@ class AppContext:
         if old_name in categories:
             categories[categories.index(old_name)] = new_name
         if mapped:
-            mapping[new_name] = mapping.pop(old_name)
+            with self._grid_lock:      # 与搜索后台线程的快照读取互斥
+                mapping[new_name] = mapping.pop(old_name)
         positions = self.config.get("widgetPositions", {})
         if old_name in positions:
             positions[new_name] = positions.pop(old_name)
@@ -567,9 +606,7 @@ class AppContext:
         previews = self.config.get("widgetPreviews", {})
         if old_name in previews:
             previews[new_name] = previews.pop(old_name)
-        locked = self.config.get("lockedWidgets", [])
-        if old_name in locked:
-            locked[locked.index(old_name)] = new_name
+        titles.pop(old_name, None)            # 自定义格子的键即显示名，无需另存
         cfg.save_config(self.config)
         if not mapped:
             cfg.retarget_history_prefix(old_dir, new_dir)  # 保证历史记录仍可撤销
@@ -587,37 +624,30 @@ class AppContext:
         self.config.get("widgetSizes", {}).pop(name, None)
         self.config.get("widgetScales", {}).pop(name, None)
         self.config.get("widgetPreviews", {}).pop(name, None)
-        self.config.get("gridPaths", {}).pop(name, None)
-        locked = self.config.get("lockedWidgets", [])
-        if name in locked:
-            locked.remove(name)
+        with self._grid_lock:          # 与搜索后台线程的快照读取互斥
+            self.config.get("gridPaths", {}).pop(name, None)
         cfg.save_config(self.config)
         self.panel.refresh_category_checks()
         self.rebuild_widgets()
         self.refresh_status(f"已删除格子「{name}」，文件保留在收纳库中")
 
     def handle_rename_grid_request(self, widget: FileWidget):
-        """格子右键"重命名格子…"入口：弹输入框并执行重命名。"""
-        if widget.title in BUILTIN_GRID_NAMES:
-            QMessageBox.information(
-                self.panel, "重命名格子",
-                f"「{widget.title}」是内置分类（参与自动整理），不能重命名。\n"
-                "可以在控制面板取消勾选来隐藏它。")
-            return
+        """格子右键"重命名格子…"入口：弹输入框并执行重命名（内置分类也可改名）。"""
+        current = widget.title                 # 当前显示名（可能已被改过）
         new_name, ok = QInputDialog.getText(
-            self.panel, "重命名格子", "新名称：", text=widget.title)
+            self.panel, "重命名格子", "新名称：", text=current)
         if not ok:
             return
         new_name = new_name.strip()
-        if new_name == widget.title:
+        if new_name == current:
             return
-        error = self.rename_grid(widget.title, new_name)
+        error = self.rename_grid(widget.grid_key, new_name)
         if error:
             QMessageBox.warning(self.panel, "无法重命名", error)
 
     def handle_delete_grid_request(self, widget: FileWidget):
         """格子右键"删除此格子"入口：确认后仅移除格子，不动收纳库文件。"""
-        name = widget.title
+        name = widget.grid_key                 # 配置键：删除要按键删，不能用显示名
         if name == SEARCH_GRID_TITLE:
             answer = QMessageBox.question(
                 self.panel, "删除搜索格子",
@@ -630,7 +660,7 @@ class AppContext:
             if name in BUILTIN_GRID_NAMES else ""
         answer = QMessageBox.question(
             self.panel, "删除格子",
-            f"从桌面删除「{name}」格子{hint}？\n"
+            f"从桌面删除「{widget.title}」格子{hint}？\n"
             "收纳库中的文件夹和文件都会保留，不会丢失。",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if answer == QMessageBox.Yes:
@@ -640,7 +670,7 @@ class AppContext:
 
     def handle_preview_changed(self, widget: FileWidget, icons: bool):
         """单个格子切换预览方式：只作用于该格子并持久化。"""
-        self.config.setdefault("widgetPreviews", {})[widget.title] = bool(icons)
+        self.config.setdefault("widgetPreviews", {})[widget.grid_key] = bool(icons)
         cfg.save_config(self.config)
         mode = "图标视图" if icons else "紧凑列表"
         self.refresh_status(f"「{widget.title}」预览方式已切换为{mode}")
@@ -662,6 +692,12 @@ class AppContext:
         autostart.set_autostart(SCRIPT_PATH, enabled)
         self.config["autostart"] = enabled
         cfg.save_config(self.config)
+
+    # ---------- 快捷启动 ----------
+
+    def create_shortcuts(self) -> list:
+        """在桌面与开始菜单生成启动快捷方式，返回创建成功的 .lnk 路径列表。"""
+        return shortcut.create_launch_shortcuts()
 
     # ---------- 游戏模式 ----------
 
@@ -725,7 +761,7 @@ class AppContext:
         """收纳库目录有改动（整理/拖入/外部增删）：防抖后定向刷新受影响格子。"""
         if self._game_mode or self._widgets_hidden:
             return                       # 游戏模式/隐藏期间不做无谓刷新
-        self._pending_dirs.add(os.path.normcase(str(path)))
+        self._pending_dirs.add(_norm_dir(path))     # 与 _refresh_pending 用同一归一化
         self._refresh_timer.start(REFRESH_DEBOUNCE_MS)
         # 防抖期间可能新建了分类目录，刷新时顺带补挂监听
         QTimer.singleShot(REFRESH_DEBOUNCE_MS + 50, self._sync_watcher_paths)
@@ -741,6 +777,7 @@ class AppContext:
             self._auto_stable.clear()
             self._auto_rounds.clear()
             self._auto_attempts.clear()
+            self._load_auto_collected()   # 从历史恢复同名保护名单（跨重启）
             self._sync_auto_watcher()
             delay = int(self.config.get("autoOrganizeDelay", 300))
             self.refresh_status(f"自动整理已开启（新文件静置 {delay} 秒后收纳）")
@@ -780,6 +817,7 @@ class AppContext:
                 self._auto_watcher.addPaths([desktop])
                 self._auto_seen = set(self._list_desktop())  # 开始监听时以当前桌面为基线
                 self._auto_seen -= set(self._auto_stable)    # 待确认条目仍算"新"，不吞掉
+                self._load_auto_collected()  # 重挂监听时刷新同名保护名单（含历史恢复）
         elif current:
             self._auto_watcher.removePaths(current)
 
@@ -790,20 +828,76 @@ class AppContext:
         delay = max(5, int(self.config.get("autoOrganizeDelay", 300)))
         self._auto_timer.start(delay * 1000)
 
-    def _stat_entry(self, name: str):
-        """取桌面条目的稳定性快照；文件=(大小, mtime)，文件夹=(条目数, mtime)。
+    @staticmethod
+    def _count_tree(root: str, cap: int) -> int:
+        """统计目录树内条目总数；一旦达到 cap 立即返回（表示"未扫完/仍在增长"）。
 
-        文件夹用"直接子条目数 + 目录 mtime"：解压/拷贝程序每落一个文件，
-        这两个值都会变，足以识别"还在写入中"。条目不存在返回 None。
+        只数不计内容，os.walk 逐层 yield，命中上限即提前结束，
+        因此超大文件夹的代价也被压在 cap 级别。
+        """
+        total = 0
+        for _cur, dirs, files in os.walk(root):
+            total += len(dirs) + len(files)
+            if total >= cap:
+                return cap
+        return total
+
+    def _stat_entry(self, name: str):
+        """取桌面条目的稳定性快照；不存在返回 None。
+
+        文件=(大小, mtime_ns)，文件夹=(递归条目数, mtime_ns)。
+        两点关键设计：
+        1) 文件夹必须**递归**计数。拷贝/解压程序往子目录里逐层落文件时，
+           顶层条目数与顶层目录 mtime 都不变，只统计顶层会把"半拷贝"的
+           文件夹误判为已稳定而整体搬走，释放方随后按原路径重建 →
+           收纳库堆出副本（v2.7.0 副本根因）。
+        2) 用 mtime_ns 而非 int(st_mtime)：秒级截断会把同一秒内的
+           最后一次写入抹平，同样制造"假稳定"。
         """
         try:
             path = os.path.join(org.get_desktop_path(), name)
             stat = os.stat(path)
-            if os.path.isdir(path):
-                return (len(os.listdir(path)), int(stat.st_mtime))
-            return (stat.st_size, int(stat.st_mtime))
         except OSError:
             return None
+        if os.path.isdir(path):
+            return (self._count_tree(path, AUTO_DIR_SCAN_CAP), stat.st_mtime_ns)
+        return (stat.st_size, stat.st_mtime_ns)
+
+    def _forget_pending(self, name: str):
+        """把条目移出自动整理的待确认/观察表（收纳成功、放弃或跳过时统一清理）。"""
+        self._auto_stable.pop(name, None)
+        self._auto_rounds.pop(name, None)
+
+    def _load_auto_collected(self):
+        """从撤销历史恢复"近期已自动收纳"名单，让同名保护跨重启生效。
+
+        释放源（网盘同步等）反复释放同名条目时，应用重启会丢掉内存里的
+        保护名单，导致再次照单全收。历史记录里每条移动都带时间戳，
+        天然是持久化凭据：guard 窗口内收纳过的名字一律跳过。
+
+        用记录的 src（原桌面名）而不是 dst 取名字：收纳库已有同名条目时
+        dst 会被改成"名 (2)"，与桌面上真实再现的名字对不上，保护就失效了。
+        """
+        from datetime import datetime, timedelta
+        cutoff = datetime.now() - timedelta(seconds=AUTO_DUP_GUARD_S)
+        collected = {}
+        for rec in cfg.load_history():
+            try:
+                moved_at = datetime.fromisoformat(rec.get("time", ""))
+            except ValueError:
+                continue
+            if moved_at < cutoff:
+                continue
+            src = rec.get("src", "")
+            if src:
+                name = os.path.basename(src)
+                ts = moved_at.timestamp()
+                if collected.get(name, 0) < ts:
+                    collected[name] = ts
+        for name, ts in self._auto_collected.items():   # 与内存记录合并取新
+            if collected.get(name, 0) < ts:
+                collected[name] = ts
+        self._auto_collected = collected
 
     def _run_auto_organize(self):
         """静置计时结束：新条目先进入稳定性确认，不再立即搬运。
@@ -865,8 +959,7 @@ class AppContext:
         for name, snap in list(self._auto_stable.items()):
             current = self._stat_entry(name)
             if current is None:
-                self._auto_stable.pop(name, None)   # 消失了（改名/手动处理）
-                self._auto_rounds.pop(name, None)
+                self._forget_pending(name)          # 消失了（改名/手动处理）
             elif current == snap:
                 stable.append(name)
             else:
@@ -875,8 +968,7 @@ class AppContext:
         for name in churning:
             rounds = self._auto_rounds.get(name, 0) + 1
             if rounds >= AUTO_MAX_CONFIRM_ROUNDS:
-                self._auto_stable.pop(name, None)   # 观察上限已到：放弃该条目
-                self._auto_rounds.pop(name, None)
+                self._forget_pending(name)          # 观察上限已到：放弃该条目
                 self._auto_seen.add(name)
                 self.refresh_status(
                     f"「{name}」持续变化超过 {AUTO_MAX_CONFIRM_ROUNDS} 轮观察，"
@@ -891,18 +983,29 @@ class AppContext:
             self._auto_seen |= set(self._list_desktop()) - set(self._auto_stable)
             return
 
-        records, failed = org.organize_desktop(
+        records, failed, skipped = org.organize_desktop(
             org.get_desktop_path(), self.config["storageRoot"],
             include_shortcuts=bool(self.config.get("includeShortcuts", False)),
             include_folders=bool(self.config.get("includeFolders", True)),
-            only_names=set(stable), skip_in_progress=True, return_failed=True)
+            only_names=set(stable), skip_in_progress=True, return_failed=True,
+            enabled_categories=set(self.config.get("categories", [])))
 
+        # skipped = 因收录开关关闭而有意留在桌面的条目：撤出待确认，但**不**记入
+        # 已收纳名单、也**不**入基线 —— 否则它会被当成"已处理"而在用户之后
+        # 打开开关时永久不再收纳（旧实现把它们混进 set(stable)-set(failed)）。
+        for name in skipped:
+            self._forget_pending(name)
+
+        # 只有真正搬运成功的条目才记入同名保护；用记录里的 src 原名，
+        # 不要用"确认时还在待确认"的名字（可能已在缝隙里消失）。
+        moved = {os.path.basename(rec.src) for rec in records}
         now = time.time()
-        for name in set(stable) - set(failed):
-            self._auto_stable.pop(name, None)
-            self._auto_rounds.pop(name, None)
+        for name in moved:
+            self._forget_pending(name)
             self._auto_attempts.pop(name, None)
             self._auto_collected[name] = now       # 记录时间戳，供同名重复保护
+        for name in set(stable) - moved - set(failed) - set(skipped):
+            self._forget_pending(name)             # 搬运前一刻消失，停止跟踪
 
         if failed:
             retry, give_up = [], []
@@ -911,8 +1014,7 @@ class AppContext:
                 if attempts >= AUTO_MAX_ATTEMPTS:
                     give_up.append(name)
                     self._auto_attempts.pop(name, None)
-                    self._auto_stable.pop(name, None)   # 移出待确认，停止重试
-                    self._auto_rounds.pop(name, None)
+                    self._forget_pending(name)   # 移出待确认，停止重试
                     self._auto_seen.add(name)      # 放弃重试：入基线，不再打扰
                 else:
                     self._auto_attempts[name] = attempts
@@ -935,8 +1037,10 @@ class AppContext:
             cfg.append_records([r.to_dict() for r in records])
             self.refresh_all()
             self.refresh_status(f"自动整理：已收纳 {len(records)} 个新文件/文件夹")
-        # 基线 = 当前桌面 \ 待确认（待确认与待重试的仍是"新"，等待下一轮）
-        self._auto_seen |= set(self._list_desktop()) - set(self._auto_stable)
+        # 基线 = 当前桌面 \ 待确认 \ 被开关跳过的（后两类仍是"新"，
+        # 待确认等下一轮、被跳过的等开关打开后有机会再收）
+        self._auto_seen |= (set(self._list_desktop())
+                            - set(self._auto_stable) - set(skipped))
 
     # ---------- 业务回调（供控制面板调用） ----------
 

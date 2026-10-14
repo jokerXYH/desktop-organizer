@@ -84,7 +84,7 @@ def test_history_cap(tmp_path, monkeypatch):
 def test_defaults_contain_v2_keys():
     """默认配置应包含 v2 新增键。"""
     for key in ("includeFolders", "autostart", "previewIcons",
-                "gameMode", "widgetPositions", "widgetSizes", "lockedWidgets",
+                "gameMode", "widgetPositions", "widgetSizes",
                 "confirmOrganize", "panelGeometry", "widgetScales",
                 "widgetPreviews", "gridPaths", "autoOrganize",
                 "autoOrganizeDelay", "searchGrid"):
@@ -219,3 +219,23 @@ def test_save_history_atomic(tmp_path, monkeypatch):
     assert [p.name for p in tmp_path.iterdir()] == ["h.json"]
     data = json.loads((tmp_path / "h.json").read_text(encoding="utf-8"))
     assert data == [{"src": "a", "dst": "b", "batch": "b1"}]
+
+
+# ---------- 打包成 exe 后的程序目录 ----------
+
+def test_app_dir_source_mode_is_project_root():
+    """源码运行时程序目录就是项目根目录（收纳库默认建在这里）。"""
+    assert cfg.app_dir() == os.path.dirname(os.path.abspath(cfg.__file__))
+    assert os.path.isdir(cfg.app_dir())
+
+
+def test_app_dir_frozen_uses_exe_folder(tmp_path, monkeypatch):
+    """打包成 exe 后程序目录取 exe 所在目录。
+
+    关键点：绝不能退回临时解包目录——否则默认收纳库会随临时目录一起被删，
+    用户整理的资料跟着丢失。
+    """
+    monkeypatch.setattr(cfg.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(cfg.sys, "executable", str(tmp_path / "桌面分类助手.exe"))
+
+    assert cfg.app_dir() == str(tmp_path)

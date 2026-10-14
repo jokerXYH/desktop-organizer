@@ -36,3 +36,12 @@ def test_build_command_keeps_pythonw_and_missing_pythonw(tmp_path):
     cmd2 = autostart.build_autostart_command(
         str(tmp_path / "python.exe"), r"E:\x\main.py")
     assert str(tmp_path / "python.exe") in cmd2
+
+
+def test_build_command_frozen_exe_without_script():
+    """打包成 exe 后自启项只写 exe 自身，不带脚本参数。
+
+    否则会指向 __file__（onefile 的临时解包目录），下次开机自启必然失败。
+    """
+    cmd = autostart.build_autostart_command(r"D:\App\桌面分类助手.exe")
+    assert cmd == r'"D:\App\桌面分类助手.exe"'

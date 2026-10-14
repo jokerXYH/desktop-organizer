@@ -7,8 +7,8 @@ v2：新增开机自启、游戏模式、预览方式切换、收纳库搜索与
 """
 import os
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer
+from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,
                                QFileDialog, QGridLayout, QHBoxLayout,
                                QLabel, QLineEdit, QListWidget,
@@ -18,32 +18,99 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,
 import autostart
 import config as cfg
 import organizer as org
-from widgets import open_in_shell
+from widgets import COLOR_ACCENT, COLOR_TEXT, COLOR_TEXT_DIM, open_in_shell
 
 PANEL_WIDTH = 480    # 面板宽度
 PANEL_HEIGHT = 760   # 面板高度
 SEARCH_DEBOUNCE_MS = 300          # 搜索输入防抖
 SEARCH_RESULT_LIMIT = 100         # 搜索结果上限（与 organizer.search_storage 一致）
 
-# 面板暗色 QSS：Fluent 风格圆角控件
+# 面板玻璃拟态 QSS：深色底 + 浅白描边 + 半透明控件层叠（与桌面格子同一套语言）
 PANEL_QSS = """
-QWidget{background:#1e2025;color:#e8eaed;font-family:"Microsoft YaHei UI";font-size:12px;}
-QLabel#sectionLabel{color:#8a90a0;font-size:11px;}
-QPushButton{background:#2a2d34;border:1px solid #3a3d46;border-radius:8px;padding:6px 14px;color:#e8eaed;}
-QPushButton:hover{background:#33373f;border-color:#4cc2ff;}
-QPushButton:pressed{background:#23262c;}
-QPushButton#accentBtn{background:#4cc2ff;border:none;color:#101418;font-weight:bold;}
-QPushButton#accentBtn:hover{background:#6bcfff;}
-QLineEdit{background:#26282e;border:1px solid #3a3d46;border-radius:8px;padding:5px 8px;color:#e8eaed;}
-QLineEdit:focus{border-color:#4cc2ff;}
-QCheckBox{spacing:6px;background:transparent;}
-QComboBox{background:#26282e;border:1px solid #3a3d46;border-radius:8px;padding:4px 8px;}
-QComboBox QAbstractItemView{background:#26282e;color:#e8eaed;selection-background-color:rgba(76,194,255,70);}
-QListWidget{background:#23252b;border:1px solid #3a3d46;border-radius:8px;outline:0;}
-QListWidget::item{padding:4px;border-radius:5px;}
-QListWidget::item:hover{background:rgba(255,255,255,18);}
-QListWidget::item:selected{background:rgba(76,194,255,70);color:#ffffff;}
+QWidget{background:#17181b;color:#eceef1;font-family:"Microsoft YaHei UI";font-size:12px;}
+QLabel{background:transparent;}
+QLabel#sectionLabel{color:#9ba1ab;font-size:11px;}
+QPushButton{background:rgba(255,255,255,14);border:1px solid rgba(255,255,255,30);
+            border-radius:9px;padding:7px 14px;color:#eceef1;}
+QPushButton:hover{background:rgba(255,255,255,26);border-color:rgba(255,255,255,150);}
+QPushButton:pressed{background:rgba(255,255,255,8);}
+QPushButton#accentBtn{background:qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                     stop:0 #ccd4dd, stop:1 #a6b0bd);
+                     border:none;color:#14171b;font-weight:bold;border-radius:9px;}
+QPushButton#accentBtn:hover{background:qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                     stop:0 #dbe2e9, stop:1 #b6c0cc);}
+QPushButton#accentBtn:pressed{background:#a6b0bd;}
+QLineEdit{background:rgba(255,255,255,10);border:1px solid rgba(255,255,255,28);
+          border-radius:9px;padding:6px 10px;color:#eceef1;
+          selection-background-color:rgba(255,255,255,70);}
+QLineEdit:focus{border-color:rgba(255,255,255,150);background:rgba(255,255,255,16);}
+QComboBox{background:rgba(255,255,255,10);border:1px solid rgba(255,255,255,28);
+          border-radius:9px;padding:5px 10px;color:#eceef1;}
+QComboBox:hover{border-color:rgba(255,255,255,150);}
+QComboBox::drop-down{border:none;width:22px;}
+QComboBox QAbstractItemView{background:#1d2129;color:#eceef1;outline:0;
+          border:1px solid rgba(255,255,255,30);border-radius:8px;padding:4px;
+          selection-background-color:rgba(255,255,255,70);}
+QListWidget{background:rgba(0,0,0,70);border:1px solid rgba(255,255,255,26);
+            border-radius:10px;outline:0;padding:4px;}
+QListWidget::item{padding:6px;border-radius:7px;}
+QListWidget::item:hover{background:rgba(255,255,255,16);}
+QListWidget::item:selected{background:rgba(255,255,255,60);color:#ffffff;}
+QScrollBar:vertical{background:transparent;width:8px;margin:2px;}
+QScrollBar::handle:vertical{background:rgba(255,255,255,50);border-radius:4px;
+                            min-height:28px;}
+QScrollBar::handle:vertical:hover{background:#93a1b3;}
+QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}
+QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:transparent;}
 """
+
+
+class GlassCheckBox(QCheckBox):
+    """玻璃拟态勾选框：自绘圆角指示器（选中=钢灰填充 + 深色对勾）。
+
+    为什么不用 QSS 直接改 ::indicator：QSS 只能替换指示器的底色/边框，
+    画不出对勾（对勾需要外部图片资源）；为免引入图片依赖，这里用一个
+    极轻量的自绘指示器替代，仅覆盖绘制，不影响 isChecked/toggled 等逻辑。
+    """
+
+    BOX = 16        # 指示器边长（像素）
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self.setAttribute(Qt.WA_Hover, True)   # 开启悬停事件以支持 hover 反馈
+
+    def paintEvent(self, event):
+        """自绘：左侧圆角指示器 + 右侧文字（按勾选/悬停状态切换配色）。"""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        box = self.BOX
+        rect = QRectF(0, (self.height() - box) / 2, box, box)
+        hovered = self.underMouse()
+
+        if self.isChecked():                    # 选中：钢灰圆角块 + 深色对勾
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(COLOR_ACCENT))
+            painter.drawRoundedRect(rect, 5, 5)
+            pen = QPen(QColor("#14171b"), 2)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            painter.setPen(pen)
+            left, top = rect.x(), rect.y()
+            painter.drawPolyline([
+                QPointF(left + box * 0.26, top + box * 0.53),
+                QPointF(left + box * 0.43, top + box * 0.69),
+                QPointF(left + box * 0.75, top + box * 0.32),
+            ])
+        else:                                   # 未选中：半透明玻璃小方块，悬停时提亮
+            # 面板底色本身很暗，透明度太低会"看不见勾选框"——提高描边/填充对比度
+            painter.setPen(QPen(QColor(255, 255, 255, 110 if hovered else 78), 1))
+            painter.setBrush(QColor(255, 255, 255, 40 if hovered else 24))
+            painter.drawRoundedRect(rect, 5, 5)
+
+        painter.setPen(QColor(COLOR_TEXT))
+        painter.setFont(self.font())
+        painter.drawText(QRect(box + 8, 0, self.width() - box - 8, self.height()),
+                         Qt.AlignLeft | Qt.AlignVCenter, self.text())
 
 
 class ControlPanel(QWidget):
@@ -53,7 +120,7 @@ class ControlPanel(QWidget):
         """初始化面板。
 
         :param ctx: AppContext，需提供 on_organize/on_undo/on_widgets_rebuild/
-                    set_autostart/set_game_mode/set_preview 回调与
+                    set_autostart/create_shortcuts/set_game_mode/set_preview 回调与
                     refresh_status(text) 方法
         """
         super().__init__()
@@ -95,20 +162,30 @@ class ControlPanel(QWidget):
         cfg_row.addWidget(browse_btn)
         layout.addLayout(cfg_row)
 
+        # ---- 快捷启动：一键在桌面与开始菜单生成启动快捷方式 ----
+        launch_row = QHBoxLayout()
+        launch_label = QLabel("快捷启动:")
+        launch_label.setObjectName("sectionLabel")
+        self.shortcut_btn = QPushButton("创建快捷方式（桌面 + 开始菜单）")
+        self.shortcut_btn.clicked.connect(self._create_shortcuts)
+        launch_row.addWidget(launch_label)
+        launch_row.addWidget(self.shortcut_btn)
+        layout.addLayout(launch_row)
+
         # ---- 第三行：功能开关（自启 / 游戏模式 / 收录选项 / 预览方式） ----
         option_grid = QGridLayout()
-        self.shortcut_check = QCheckBox("整理时收走快捷方式")
+        self.shortcut_check = GlassCheckBox("整理时收走快捷方式")
         self.shortcut_check.setChecked(
             bool(self.ctx.config.get("includeShortcuts", False)))
         self.shortcut_check.toggled.connect(self._save_shortcut_option)
-        self.folder_check = QCheckBox("整理时收走文件夹")
+        self.folder_check = GlassCheckBox("整理时收走文件夹")
         self.folder_check.setChecked(
             bool(self.ctx.config.get("includeFolders", True)))
         self.folder_check.toggled.connect(self._save_folder_option)
-        self.autostart_check = QCheckBox("开机自启")
+        self.autostart_check = GlassCheckBox("开机自启")
         self.autostart_check.setChecked(autostart.get_autostart_enabled())
         self.autostart_check.toggled.connect(self._toggle_autostart)
-        self.game_check = QCheckBox("游戏模式（隐藏格子并暂停监听）")
+        self.game_check = GlassCheckBox("游戏模式（隐藏格子并暂停监听）")
         self.game_check.setChecked(
             bool(self.ctx.config.get("gameMode", False)))
         self.game_check.toggled.connect(
@@ -125,12 +202,12 @@ class ControlPanel(QWidget):
         option_grid.addWidget(self.folder_check, 1, 1)
         option_grid.addWidget(preview_label, 2, 0)
         option_grid.addWidget(self.preview_combo, 2, 1)
-        self.confirm_check = QCheckBox("整理前先预览确认")
+        self.confirm_check = GlassCheckBox("整理前先预览确认")
         self.confirm_check.setChecked(
             bool(self.ctx.config.get("confirmOrganize", True)))
         self.confirm_check.toggled.connect(self._save_confirm_option)
         option_grid.addWidget(self.confirm_check, 3, 0)
-        self.auto_check = QCheckBox("自动整理新桌面文件")
+        self.auto_check = GlassCheckBox("自动整理新桌面文件")
         self.auto_check.setChecked(
             bool(self.ctx.config.get("autoOrganize", False)))
         self.auto_check.toggled.connect(
@@ -150,7 +227,7 @@ class ControlPanel(QWidget):
                 self._auto_delay_values[index]))
         option_grid.addWidget(self.auto_check, 4, 0)
         option_grid.addWidget(self.auto_delay_combo, 4, 1)
-        self.search_grid_check = QCheckBox("桌面搜索格子")
+        self.search_grid_check = GlassCheckBox("桌面搜索格子")
         self.search_grid_check.setChecked(
             bool(self.ctx.config.get("searchGrid", False)))
         self.search_grid_check.toggled.connect(
@@ -209,7 +286,8 @@ class ControlPanel(QWidget):
 
         # ---- 状态栏 ----
         self.status_label = QLabel("就绪")
-        self.status_label.setStyleSheet("color:#9aa0aa;background:transparent;")
+        self.status_label.setStyleSheet(
+            f"color:{COLOR_TEXT_DIM};background:transparent;padding:2px;")
         layout.addWidget(self.status_label)
 
     # ---------- 操作回调 ----------
@@ -223,10 +301,14 @@ class ControlPanel(QWidget):
         desktop = org.get_desktop_path()
         include_shortcuts = self.shortcut_check.isChecked()
         include_folders = self.folder_check.isChecked()
+        # 仅收纳"当前显示为格子"的分类：分类没有对应格子时把文件搬进收纳库
+        # 会让用户找不到（旧行为是把视频类文件收进无格子的目录后凭空消失）
+        enabled = set(self.ctx.config.get("categories", []))   # 搜索格子不在其中
         if self.ctx.config.get("confirmOrganize", True):
             try:
                 preview = org.preview_organize(
-                    desktop, root, include_shortcuts, include_folders)
+                    desktop, root, include_shortcuts, include_folders,
+                    enabled_categories=enabled)
             except RuntimeError as exc:
                 QMessageBox.critical(self, "整理失败", str(exc))
                 return
@@ -237,15 +319,23 @@ class ControlPanel(QWidget):
                 self.ctx.refresh_status("已取消整理")
                 return
         try:
-            records, failed = org.organize_desktop(
+            records, failed, skipped = org.organize_desktop(
                 desktop, root,
                 include_shortcuts=include_shortcuts,
-                include_folders=include_folders, return_failed=True)
-        except RuntimeError as exc:
+                include_folders=include_folders, return_failed=True,
+                enabled_categories=enabled)
+        except (RuntimeError, OSError) as exc:
+            # OSError：organizer 里 os.makedirs 建分类目录失败（磁盘只读/权限等），
+            # 旧实现只捕 RuntimeError，会让异常逃出槽函数，用户看不到任何提示。
             QMessageBox.critical(self, "整理失败", str(exc))
             return
         cfg.append_records([r.to_dict() for r in records])
         self.ctx.on_organize(len(records))
+        if skipped:                         # 分类未启用格子：有意留在桌面，必须告知
+            self.ctx.refresh_status(
+                f"{len(skipped)} 项留在桌面：对应分类未显示为格子"
+                "（可在「显示的格子」中勾选后再整理）")
+            return
         if failed:                          # 失败（被占用等）不再静默，明确告知
             names = "、".join(failed[:3])
             suffix = f" 等 {len(failed)} 项" if len(failed) > 3 else ""
@@ -363,7 +453,7 @@ class ControlPanel(QWidget):
                 names.append(name)          # 自定义格子
         names.append("其他")
         for i, name in enumerate(names):
-            check = QCheckBox(name)
+            check = GlassCheckBox(name)
             check.setChecked(name in categories)
             check.toggled.connect(self._save_categories)
             self.category_checks[name] = check
@@ -386,6 +476,21 @@ class ControlPanel(QWidget):
             self.autostart_check.setChecked(not checked)
             self.autostart_check.blockSignals(False)
             QMessageBox.warning(self, "开机自启设置失败", str(exc))
+
+    def _create_shortcuts(self):
+        """生成桌面与开始菜单快捷方式并汇报结果（含组合键提示）。"""
+        try:
+            created = self.ctx.create_shortcuts()
+        except (RuntimeError, OSError) as exc:
+            QMessageBox.warning(self, "创建快捷方式失败", str(exc))
+            return
+        self.ctx.refresh_status(
+            f"已创建 {len(created)} 个快捷方式（可直接双击启动）")
+        QMessageBox.information(
+            self, "创建完成",
+            "已创建以下快捷方式：\n" + "\n".join(created) +
+            "\n\n提示：双击即可启动；若已常驻托盘，"
+            "按 Ctrl+Alt+D 可随时唤起控制面板。")
 
     def _change_preview(self, index: int):
         """批量切换全部格子的预览方式（单个格子用右键菜单切换）。"""

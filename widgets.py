@@ -6,35 +6,49 @@
 - 格子里选中的文件/文件夹（可多选）可拖出到资源管理器、桌面或其它格子
 - 预览方式可在"图标视图 / 紧凑列表"间切换（右键菜单），图标模式显示
   Windows 真实文件图标（QFileIconProvider，系统级缓存，开销极低）
+- 图片类文件（jpg/png/gif 等栅格图）显示内容缩略图：解码在后台线程执行，
+  缩放后的 QImage 先缓存再由 GUI 线程转成图标，避免大图/多图卡住界面
 - 窗口拖动结束后通过防抖回调上报位置，实现"格子位置记忆"
 """
 import os
 import subprocess
+import threading
+import weakref
 
-from PySide6.QtCore import (QFileInfo, QMimeData, QPoint, QRect, QSize, Qt,
-                            QTimer, QUrl)
+from PySide6.QtCore import (QFileInfo, QMimeData, QObject, QPoint, QRect, QRectF,
+                            QRunnable, QSize, QThreadPool, Qt, QTimer, QUrl,
+                            Signal)
 from PySide6.QtGui import (QAction, QActionGroup, QBrush, QColor, QFont,
-                           QIcon, QImage, QPainter, QPainterPath, QPen,
-                           QPixmap)
+                           QIcon, QImage, QImageReader, QLinearGradient,
+                           QPainter, QPainterPath, QPen, QPixmap)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication,
-                               QFileIconProvider, QHBoxLayout, QLabel,
-                               QLineEdit, QListWidget, QListWidgetItem,
+                               QFileIconProvider, QHBoxLayout, QInputDialog,
+                               QLabel, QLineEdit, QListWidget, QListWidgetItem,
                                QListView, QMenu, QMessageBox, QVBoxLayout,
                                QWidget)
 
-from organizer import CATEGORY_RULES, FOLDER_CATEGORY, move_to_recycle_bin
+from organizer import (CATEGORY_RULES, FOLDER_CATEGORY, move_to_recycle_bin,
+                       rename_entry)
 
 # 格子外观常量
 WIDGET_WIDTH = 270        # 格子宽度（像素）
 WIDGET_HEIGHT = 360       # 格子高度（像素）
-BG_ALPHA = 232            # 背景不透明度（0-255）
-CORNER_RADIUS = 14        # 圆角半径
+BG_ALPHA = 208            # 玻璃主背景不透明度（比纯暗色更透，透出壁纸形成毛玻璃观感）
+CORNER_RADIUS = 12        # 圆角半径（收敛一些，避免大圆角带来的"气泡感"）
 TITLE_BAR_HEIGHT = 36     # 标题栏高度
 ICON_SIZE = 38            # 图标模式下文件图标的边长（像素）
 GRID_CELL_W = 76          # 图标模式网格单元宽（保证每行 3 列排满）
 GRID_CELL_H = 84          # 图标模式网格单元高
+COMPACT_ICON_PX = 24      # 紧凑列表左侧图标/缩略图的边长（比原 16px 更能看出图片内容）
 
-# 内置分类（由扩展名/文件夹规则决定，参与自动整理）：不可重命名
+# 桌面搜索格子：扁平搜索条——平时只有"搜索框高度"，有结果时才向下展开显示结果
+SEARCH_BAR_WIDTH = 300    # 搜索条宽度（仍是"一个搜索框"的尺度）
+SEARCH_BAR_HEIGHT = 46    # 搜索条高度（仅容纳输入框，不再占满 270×360）
+SEARCH_RESULT_ROW_H = 28  # 结果行高（用于估算展开高度）
+SEARCH_RESULT_MAX_ROWS = 9  # 展开时最多显示的结果行数（再多就滚动）
+
+# 内置分类（由扩展名/文件夹规则决定，参与自动整理）：
+# 可以改"显示名"，但分类键（文件夹名与 classify() 的返回值）必须保持稳定
 BUILTIN_GRID_NAMES = set(CATEGORY_RULES) | {FOLDER_CATEGORY}
 
 # 桌面搜索格子的保留名称（独立于分类，位置/尺寸记忆也用它作键）
@@ -45,37 +59,62 @@ MAX_LIST_ITEMS = 200            # 列表最多渲染的条目数，防止大目�
 POSITION_SAVE_DELAY_MS = 600    # 拖动停止后延迟保存位置的防抖时间
 SNAP_DISTANCE = 10              # 拖动窗口时与其它格子边缘对齐的吸附距离（像素）
 
+# 格子条目的拖出效果：只声明"移动"，避免跨盘（D: 收纳库 -> C: 桌面）被系统
+# 按"复制"处理而把源文件留在收纳库里（详见 FileListWidget.startDrag 的说明）
+DRAG_ACTION = Qt.MoveAction
+
 # 自由调整窗口尺寸（拖拽右/下边缘或右下角，内容自动重排）
 RESIZE_EDGE = 8                 # 边缘/角落拖拽热区宽度（像素；6px 在小格子上难点中）
 MIN_WIDGET_W, MIN_WIDGET_H = 170, 150      # 窗口最小宽高
 MAX_WIDGET_W, MAX_WIDGET_H = 1200, 1200    # 窗口最大宽高
 SIZE_SAVE_DELAY_MS = 600        # 尺寸保存防抖（与位置保存同节奏）
 
-# 图标/列宽缩放（Ctrl+滚轮 / 右键"尺寸调整"）：按档位缩放单元格，窗口尺寸不变
+# 图标/列宽缩放（Ctrl+滚轮）：按档位缩放单元格，窗口尺寸不变
 SCALE_LEVELS = (0.75, 0.85, 1.0, 1.15, 1.3, 1.5)
 SCALE_MIN, SCALE_MAX = SCALE_LEVELS[0], SCALE_LEVELS[-1]
 
-# 暗色主题色（Fluent 风格）
-COLOR_BG = QColor(28, 30, 36, BG_ALPHA)        # 格子背景
-COLOR_BORDER = QColor(64, 68, 80)              # 边框
-COLOR_TEXT = "#e8eaed"                         # 主文字
-COLOR_ACCENT = "#4cc2ff"                       # 强调色（Fluent 蓝）
+# 图片缩略图：可直接像素解码的栅格图（svg/psd/ai/ico 交给系统图标，不做解码）
+THUMB_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
+THUMB_MAX_SRC_BYTES = 40 * 1024 * 1024   # 超大图不缩略（PNG 需全量解码，避免卡顿）
+THUMB_CACHE_MAX = 500                    # 缩略图缓存上限，超出后淘汰最早的一半
 
-# 格子列表的 QSS：暗色透明背景 + 圆角悬停高亮 + 暗色细滚动条
+# 玻璃拟态主题色：中性暗色底 + 单层浅描边（"深底 + 细边"，去掉霓虹蓝与发光）
+COLOR_BG = QColor(31, 31, 35, BG_ALPHA)             # 玻璃主背景（渐变亮端，在上方）
+COLOR_BG_BOTTOM = QColor(22, 22, 25, BG_ALPHA)      # 玻璃主背景（渐变暗端，在下方）
+COLOR_GLOW = QColor(255, 255, 255, 16)              # 顶部高光渐变的起始色（弱化，只留一点玻璃反光）
+COLOR_BORDER = QColor(255, 255, 255, 30)            # 外描边：中性浅灰细线
+COLOR_INNER_HIGHLIGHT = QColor(255, 255, 255, 12)   # 内描边：更淡的一圈，做出玻璃"厚度"而不刺眼
+COLOR_SEPARATOR = QColor(255, 255, 255, 22)         # 标题分隔线（左右渐隐，比实线更精致）
+COLOR_TEXT = "#eceef1"                              # 主文字
+COLOR_TEXT_DIM = "#9ba1ab"                          # 次级文字（条目计数、状态提示）
+COLOR_TEXT_FAINT = "#6f747d"                        # 弱提示文字（空状态引导）
+COLOR_ACCENT = "#93a1b3"                            # 强调色（低饱和钢灰，替代原霓虹蓝）
+
+# 格子列表的 QSS：透明背景 + 玻璃圆角悬停/选中 + 半透明细滚动条
 LIST_QSS = (
-    "QListWidget{background:transparent;border:none;color:%s;outline:0;}"
-    "QListWidget::item{border-radius:6px;}"
-    "QListWidget::item:hover{background:rgba(255,255,255,18);}"
-    "QListWidget::item:selected{background:rgba(76,194,255,60);color:#ffffff;}"
+    "QListWidget{background:transparent;border:none;color:%s;outline:0;padding:2px;}"
+    "QListWidget::item{border-radius:8px;padding:2px;}"
+    "QListWidget::item:hover{background:rgba(255,255,255,16);}"
+    "QListWidget::item:selected{background:rgba(255,255,255,30);color:#ffffff;"
+    "border:1px solid rgba(255,255,255,88);}"
     "QScrollBar:vertical{background:transparent;width:8px;margin:2px 1px;}"
-    "QScrollBar::handle:vertical{background:#3a3d46;border-radius:4px;min-height:28px;}"
-    "QScrollBar::handle:vertical:hover{background:#4cc2ff;}"
+    "QScrollBar::handle:vertical{background:rgba(255,255,255,54);"
+    "border-radius:4px;min-height:28px;}"
+    "QScrollBar::handle:vertical:hover{background:%s;}"
     "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"
     "QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:transparent;}"
-) % COLOR_TEXT
+) % (COLOR_TEXT, COLOR_ACCENT)
 
-# 紧凑列表专用样式：行距更松弛（用户反馈"别那么紧凑"），左侧配 16px 小图标
-COMPACT_LIST_QSS = LIST_QSS + "QListWidget::item{padding:5px 4px;}"
+# 紧凑列表专用样式：行距更松弛（用户反馈"别那么紧凑"），左侧配 24px 小图标/缩略图
+COMPACT_LIST_QSS = LIST_QSS + "QListWidget::item{padding:6px 5px;border-radius:7px;}"
+
+# 搜索格子输入框样式：原先未设样式会退回系统浅色默认外观，与玻璃格子格格不入
+SEARCH_EDIT_QSS = (
+    "QLineEdit{background:rgba(255,255,255,14);border:1px solid rgba(255,255,255,34);"
+    "border-radius:8px;padding:5px 8px;color:%s;"
+    "selection-background-color:rgba(255,255,255,70);}"
+    "QLineEdit:focus{border-color:rgba(255,255,255,150);background:rgba(255,255,255,22);}"
+) % COLOR_TEXT
 
 # 共享图标提供器：全局仅创建一次，Windows 资源管理器图标缓存复用
 _ICON_PROVIDER = None
@@ -307,6 +346,126 @@ def sys_darwin() -> bool:
     return platform.system() == "Darwin"
 
 
+# ---------- 图片缩略图（后台解码 + 全局缓存） ----------
+
+def is_thumbnailable(path: str) -> bool:
+    """是否值得生成缩略图：扩展名支持像素解码，且源文件体积在阈值内。"""
+    if os.path.splitext(path)[1].lower() not in THUMB_EXTS:
+        return False
+    try:
+        return os.path.getsize(path) <= THUMB_MAX_SRC_BYTES
+    except OSError:
+        return False
+
+
+def decode_thumbnail(path: str, size: int) -> QImage:
+    """解码出边长不超过 size 的缩略图；失败返回空 QImage。
+
+    刻意只返回 QImage 而不返回 QIcon/QPixmap：QPixmap 只能在 GUI 线程创建，
+    本函数运行在后台线程（见 ThumbnailTask.run）。用 setScaledSize 让解码器
+    按比例出小图——JPEG 可直接按比例解码，代价远低于解码全尺寸再缩放。
+    """
+    try:
+        reader = QImageReader(path)
+        reader.setAutoTransform(True)          # 尊重 EXIF 方向，避免手机照片倒过来
+        source = reader.size()
+        if source.isValid() and not source.isEmpty():
+            reader.setScaledSize(
+                source.scaled(QSize(size, size), Qt.KeepAspectRatio))
+        image = reader.read()
+    except Exception:                          # 解码器异常不影响格子刷新
+        return QImage()
+    if image.isNull():
+        return image
+    if image.width() > size or image.height() > size:
+        image = image.scaled(size, size, Qt.KeepAspectRatio,
+                             Qt.SmoothTransformation)
+    return image
+
+
+class ThumbnailService(QObject):
+    """缩略图后台服务：全局单例，把解码丢到 QThreadPool，完成后回传 QImage。
+
+    为什么放后台：一个装满大图的目录在 UI 线程解码会把界面卡住数百毫秒到
+    数秒（刷新、整理、拖拽结束都会触发刷新）。缓存键带上 mtime，文件被改写
+    后自动失效重解码；正在解码的键记入 _pending，避免重复提交同一张图。
+    """
+
+    ready = Signal(str, int, QImage)           # (路径, 边长, 解码结果；失败为空图)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.pool = QThreadPool(self)
+        self.pool.setMaxThreadCount(2)         # 2 线程足够，避免抢占搜索等其它任务
+        self._lock = threading.Lock()          # 缓存/在途集合会被后台线程写入
+        self._cache = {}                       # {(路径, mtime, 边长): QImage}
+        self._pending = set()                  # 正在解码的键
+
+    def get(self, path: str, size: int):
+        """取缩略图：命中缓存返回 QImage；未命中则提交后台任务并返回 None。
+
+        调用方（GUI 线程）拿到 None 时先显示系统图标占位，等 ready 信号回填。
+        """
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return None
+        key = (path, mtime, int(size))
+        with self._lock:
+            cached = self._cache.get(key)
+            submit = cached is None and key not in self._pending
+            if submit:
+                self._pending.add(key)
+        if cached is not None:
+            return cached
+        if submit:
+            self.pool.start(ThumbnailTask(self, key))
+        return None
+
+    def _store(self, key, image: QImage):
+        """后台解码结束（后台线程调用）：写入缓存并广播结果。"""
+        with self._lock:
+            self._pending.discard(key)
+            if not image.isNull():
+                self._cache[key] = image
+                if len(self._cache) > THUMB_CACHE_MAX:
+                    # 键按插入顺序排列，新键在末尾：只淘汰最早的一半，不会误删刚存入的
+                    for stale in list(self._cache)[:THUMB_CACHE_MAX // 2]:
+                        self._cache.pop(stale, None)
+        self.ready.emit(key[0], key[2], image)
+
+
+class ThumbnailTask(QRunnable):
+    """一次缩略图解码任务：后台产出 QImage，经服务信号回到 GUI 线程。"""
+
+    def __init__(self, service: ThumbnailService, key: tuple):
+        super().__init__()
+        self.service = service
+        self.key = key
+
+    def run(self):
+        image = decode_thumbnail(self.key[0], self.key[2])
+        self.service._store(self.key, image)
+
+
+_THUMB_SERVICE = None
+
+
+def _dispatch_thumb(widget_ref, path: str, size: int, image: QImage):
+    """把后台缩略图结果转发给仍存活的格子（weakref 已失效则静默丢弃）。"""
+    widget = widget_ref()
+    if widget is not None:
+        widget._on_thumb_ready(path, size, image)
+
+
+def get_thumbnail_service() -> ThumbnailService:
+    """返回全局共享的缩略图服务（懒加载单例）。"""
+    global _THUMB_SERVICE
+    if _THUMB_SERVICE is None:
+        _THUMB_SERVICE = ThumbnailService()
+    return _THUMB_SERVICE
+
+
 def scale_geometry(scale: float) -> dict:
     """按缩放比计算格子的几何参数（窗口/图标/网格单元/字号）。
 
@@ -332,14 +491,16 @@ def scale_geometry(scale: float) -> dict:
 class FileListWidget(QListWidget):
     """文件列表控件：支持多选，并把选中的真实文件作为拖动源拖出到资源管理器/桌面/其它格子。
 
-    - 拖动数据使用标准 file URL（Windows 上即 CF_HDROP），复制还是移动
-      由系统默认规则决定（同盘移动、跨盘复制，可用 Shift/Ctrl 强制）。
+    - 拖动数据使用标准 file URL（Windows 上即 CF_HDROP）。
+    - 拖动结果与 Delete 键都通过回调交给外层 FileWidget 处理，控件自身不碰文件系统。
     - drag_finished_cb 在拖动结束时回调，用于刷新列表（文件被移出后立即更新）。
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.drag_finished_cb = None
+        self.delete_cb = None                  # Delete 键删除回调：(paths) -> None
+        self.rename_cb = None                  # F2 键重命名回调：(paths) -> None
         self.zoom_cb = None                    # Ctrl+滚轮缩放回调：(direction) -> None
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.setDragEnabled(True)
@@ -365,11 +526,40 @@ class FileListWidget(QListWidget):
         mime.setUrls(urls)
         return mime
 
+    def keyPressEvent(self, event):
+        """Delete 键：把选中条目交给删除回调；F2 键：交给重命名回调。
+
+        只有带真实路径（UserRole）的业务条目才参与操作；空状态下的提示条目
+        没有路径，会自然被过滤掉。
+        """
+        if event.key() == Qt.Key_Delete and callable(self.delete_cb):
+            paths = [it.data(Qt.UserRole) for it in self.selectedItems()
+                     if it.data(Qt.UserRole)]
+            if paths:
+                self.delete_cb(paths)
+                event.accept()
+                return
+        if event.key() == Qt.Key_F2 and callable(self.rename_cb):
+            paths = [it.data(Qt.UserRole) for it in self.selectedItems()
+                     if it.data(Qt.UserRole)]
+            if paths:
+                self.rename_cb(paths)
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
     def startDrag(self, supported_actions):
-        """执行拖动；结束后回调刷新，让"拖出"的结果立即可见。"""
+        """执行拖动；结束后回调刷新，让"拖出"的结果立即可见。
+
+        为什么忽略基类传来的 supportedActions、只声明"移动"：
+        Qt 把允许的拖放效果交给系统决定，资源管理器对跨盘拖放会按"复制"处理
+        （同盘才移动）。收纳库在 D:、桌面在 C:，于是"拖出格子"实际是复制，
+        源文件仍留在收纳库里 —— 格子上看起来"拖出来了却没少"，桌面上却多了
+        一份副本。只允许 MoveAction 后，跨盘拖出也会真正移走源文件。
+        """
         if not any(it.data(Qt.UserRole) for it in self.selectedItems()):
             return
-        super().startDrag(supported_actions)
+        super().startDrag(DRAG_ACTION)
         if callable(self.drag_finished_cb):
             self.drag_finished_cb()
 
@@ -409,11 +599,12 @@ class GuideOverlay(QWidget):
         self.hide()
 
     def paintEvent(self, event):
-        """绘制对齐线（主题蓝、2px）。"""
+        """绘制对齐线（中性钢灰、1px，替代原先的霓虹蓝 2px）。"""
         if not self._lines:
             return
         painter = QPainter(self)
-        painter.setPen(QPen(QColor(76, 194, 255, 220), 2))
+        pen = QPen(QColor(COLOR_ACCENT), 1)
+        painter.setPen(pen)
         for line in self._lines:
             if line.height() > line.width():
                 painter.drawLine(line.left(), line.top(),
@@ -428,25 +619,25 @@ class FileWidget(QWidget):
 
     def __init__(self, title: str, folder: str, on_drop,
                  on_position_changed=None, on_preview_changed=None,
-                 preview_icons: bool = True, locked: bool = False,
-                 on_lock_changed=None, snap_provider=None,
+                 preview_icons: bool = True,
+                 snap_provider=None,
                  on_rename_grid=None, on_delete_grid=None,
                  on_new_grid=None, on_map_folder=None,
                  size=None, metrics_scale=None,
                  on_zoom_changed=None, on_size_changed=None,
                  on_cut_files=None, on_paste_files=None,
                  clipboard_count=None, guide_show=None, guide_hide=None,
-                 parent=None):
+                 grid_key=None, parent=None):
         """初始化格子。
 
-        :param title: 格子标题（分类名）
+        :param title: 格子标题（显示名，可被用户重命名）
+        :param grid_key: 配置键（位置/尺寸/缩放/预览记忆的键）；内置分类改名后
+            title 变了但键必须保持原样，默认与 title 相同
         :param folder: 本格子对应的收纳文件夹
         :param on_drop: 拖入文件回调，签名 (list[str], FileWidget)
         :param on_position_changed: 窗口位置变化(防抖后)回调，签名 (FileWidget)
         :param on_preview_changed: 预览方式切换回调，签名 (bool)（图标视图=True）
         :param preview_icons: 初始预览方式（True=图标视图）
-        :param locked: 是否锁定位置（锁定后不能拖动窗口，右键菜单可切换）
-        :param on_lock_changed: 锁定状态变化回调，签名 (FileWidget, bool)
         :param snap_provider: 拖动吸附提供者，签名 (FileWidget) -> [QRect]（其它格子矩形）
         :param on_rename_grid: 右键"重命名格子…"回调，签名 (FileWidget)
         :param on_delete_grid: 右键"删除此格子"回调，签名 (FileWidget)
@@ -463,14 +654,13 @@ class FileWidget(QWidget):
         :param guide_hide: 隐藏对齐指示线回调
         """
         super().__init__(parent)
-        self.title = title
+        self.title = title             # 显示名（用户可见，可重命名）
+        self.grid_key = grid_key or title   # 配置键：位置/尺寸/缩放记忆与历史记录用
         self.folder = folder
         self.on_drop = on_drop
         self.on_position_changed = on_position_changed
         self.on_preview_changed = on_preview_changed
         self.preview_icons = preview_icons
-        self.locked = locked
-        self.on_lock_changed = on_lock_changed
         self.snap_provider = snap_provider
         self.on_rename_grid = on_rename_grid
         self.on_delete_grid = on_delete_grid
@@ -491,12 +681,17 @@ class FileWidget(QWidget):
             except (TypeError, ValueError):
                 self.scale = 1.0
         self._init_size = self._clamp_size(size)   # 窗口尺寸记忆 (宽, 高)
+        self._resizable = True         # 是否允许拖边缘调整大小（扁平搜索条关闭）
+        self._bar_mode = False         # 是否"只有内容区、无标题栏"的扁平形态
         self._drag_pos = None          # 窗口拖动的起始鼠标偏移
         self._resize_edge = None       # 正在拖拽调整的边缘：right / bottom / corner
         self._resize_from = None       # 调整开始时的 (鼠标全局坐标, 宽, 高)
         self._position_ready = False   # 首次 show 之前不保存位置（避免覆盖记忆值）
         self._drag_active = False      # 是否有文件正悬停拖拽在本格子上（高亮提示）
-        self._item_total = 0           # 最近一次刷新的条目总数（供锁定标签显示）
+        self._item_total = 0           # 最近一次刷新的条目总数（供标题旁计数显示）
+        self._is_empty = False         # 最近一次刷新是否为空（空状态走引导布局）
+        self._guide_active = False     # 列表当前是否已处于引导布局（避免重复切换）
+        self._thumb_items = {}         # 待回填缩略图的条目 {(路径, 边长): QListWidgetItem}
 
         # 无边框 + 置底 + 不显示任务栏按钮 + 半透明背景
         self.setWindowFlags(
@@ -517,10 +712,15 @@ class FileWidget(QWidget):
         self.title_label.setStyleSheet(f"color:{COLOR_TEXT};background:transparent;")
         self.count_label = QLabel("")
         self.count_label.setFont(QFont("Microsoft YaHei UI", 8))
-        self.count_label.setStyleSheet("color:#8a90a0;background:transparent;")
+        self.count_label.setStyleSheet(
+            f"color:{COLOR_TEXT_DIM};background:transparent;")
         self.open_btn = QLabel("打开")
         self.open_btn.setFont(QFont("Microsoft YaHei UI", 9))
-        self.open_btn.setStyleSheet(f"color:{COLOR_ACCENT};background:transparent;")
+        # "打开"按钮：胶囊形文字按钮，悬停时叠一层浅底，提示可点击
+        self.open_btn.setStyleSheet(
+            f"QLabel{{color:{COLOR_ACCENT};background:transparent;"
+            "padding:2px 7px;border-radius:7px;}"
+            "QLabel:hover{background:rgba(255,255,255,44);}")
         self.open_btn.setCursor(Qt.PointingHandCursor)
         self.open_btn.mousePressEvent = self._open_folder  # 点击打开收纳文件夹
         title_row.addWidget(self.title_label)
@@ -532,6 +732,8 @@ class FileWidget(QWidget):
         # 文件列表：图标视图（默认）或紧凑列表
         self.list_widget = FileListWidget(self)
         self.list_widget.drag_finished_cb = self.refresh   # 拖出结束后立即刷新列表
+        self.list_widget.delete_cb = self._delete_paths     # Delete 键删除选中条目
+        self.list_widget.rename_cb = self._rename_paths     # F2 键重命名选中条目
         self.list_widget.zoom_cb = self._zoom              # Ctrl+滚轮缩放
         self.list_widget.setFont(QFont("Microsoft YaHei UI", 9))
         self.list_widget.setStyleSheet(LIST_QSS)
@@ -540,6 +742,13 @@ class FileWidget(QWidget):
         self.list_widget.customContextMenuRequested.connect(self._show_menu)
         self.list_widget.itemDoubleClicked.connect(self._open_item)
         layout.addWidget(self.list_widget)
+
+        # 缩略图后台解码完成：回填对应条目的图标（信号在 GUI 线程触发）
+        # 用 weakref 转发：避免"全局服务 → 绑定方法 → 格子"的强引用把窗口钉住不释放
+        widget_ref = weakref.ref(self)
+        self._thumb_slot = (
+            lambda path, size, image: _dispatch_thumb(widget_ref, path, size, image))
+        get_thumbnail_service().ready.connect(self._thumb_slot)
 
         # 位置保存防抖定时器：拖动停止 POSITION_SAVE_DELAY_MS 后才上报
         self._pos_timer = QTimer(self)
@@ -558,26 +767,64 @@ class FileWidget(QWidget):
     # ---------- 外观绘制 ----------
 
     def paintEvent(self, event):
-        """绘制半透明圆角背景、细边框与标题分隔线。"""
+        """绘制玻璃拟态背景：渐变毛玻璃基底 + 顶部高光 + 双层描边 + 渐隐标题分隔线。
+
+        绘制顺序（后画的压在前画的上面）决定了玻璃质感：
+        1) 竖向渐变基底：上方偏亮、下方偏暗，模拟光线自上方透入玻璃；
+        2) 顶部高光：标题栏高度内由浅白渐隐到全透明，形成玻璃表面反射；
+        3) 外描边 + 内高光描边：深底配亮边，是"玻璃边缘"的关键；
+        4) 标题分隔线：左右两端渐隐，比一条实线更精致。
+        """
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+        # 内缩半像素：让 1px 描边完整落在像素内，避免被窗口边缘裁掉一半显得发虚
         path = QPainterPath()
-        path.addRoundedRect(0, 0, self.width(), self.height(),
-                            CORNER_RADIUS, CORNER_RADIUS)
-        painter.fillPath(path, COLOR_BG)
-        if self._drag_active:                       # 有文件拖拽悬停：背景微亮 + 强调色边框
-            painter.fillPath(path, QColor(76, 194, 255, 26))
-            painter.setPen(QPen(QColor(COLOR_ACCENT), 2))
+        path.addRoundedRect(
+            QRectF(0.5, 0.5, self.width() - 1, self.height() - 1),
+            CORNER_RADIUS, CORNER_RADIUS)
+
+        # 1) 毛玻璃基底：竖向渐变
+        base = QLinearGradient(0, 0, 0, self.height())
+        base.setColorAt(0.0, COLOR_BG)
+        base.setColorAt(1.0, COLOR_BG_BOTTOM)
+        painter.fillPath(path, QBrush(base))
+
+        # 2) 顶部高光：只在标题栏附近渐隐，避免整块发灰
+        glow = QLinearGradient(0, 0, 0, TITLE_BAR_HEIGHT + 26)
+        glow.setColorAt(0.0, COLOR_GLOW)
+        glow.setColorAt(1.0, QColor(255, 255, 255, 0))
+        painter.fillPath(path, QBrush(glow))
+
+        if self._drag_active:            # 有文件拖拽悬停：仅用中性描边强调，不用霓虹色
+            painter.fillPath(path, QColor(255, 255, 255, 18))
+            painter.setPen(QPen(QColor(COLOR_ACCENT), 1.5))
         else:
             painter.setPen(QPen(COLOR_BORDER, 1))
         painter.drawPath(path)
-        painter.setPen(QColor(58, 62, 74))
-        painter.drawLine(12, TITLE_BAR_HEIGHT, self.width() - 12, TITLE_BAR_HEIGHT)
+
+        # 3) 内高光描边：再描一圈更淡更窄的圆角线，做出玻璃的"厚度"
+        inner = QPainterPath()
+        inner.addRoundedRect(
+            QRectF(1.5, 1.5, self.width() - 3, self.height() - 3),
+            CORNER_RADIUS - 1, CORNER_RADIUS - 1)
+        painter.setPen(QPen(COLOR_INNER_HIGHLIGHT, 1))
+        painter.drawPath(inner)
+
+        # 4) 标题分隔线：中间实、两端渐隐
+        # 扁平形态（搜索条）没有标题栏，画线反而像边框，直接跳过
+        if not self._bar_mode:
+            separator = QLinearGradient(12, 0, self.width() - 12, 0)
+            separator.setColorAt(0.0, QColor(255, 255, 255, 0))
+            separator.setColorAt(0.5, COLOR_SEPARATOR)
+            separator.setColorAt(1.0, QColor(255, 255, 255, 0))
+            painter.setPen(QPen(QBrush(separator), 1))
+            painter.drawLine(12, TITLE_BAR_HEIGHT,
+                             self.width() - 12, TITLE_BAR_HEIGHT)
 
     # ---------- 窗口拖动与位置记忆 ----------
 
     def mousePressEvent(self, event):
-        """按下：优先响应右下边缘的尺寸调整，其次空白处拖动窗口（锁定均不响应）。"""
+        """按下：优先响应右下边缘的尺寸调整，其次空白处拖动窗口。"""
         if event.button() == Qt.LeftButton:
             edge = self._edge_at(event.position().toPoint())
             if edge is not None:
@@ -587,8 +834,7 @@ class FileWidget(QWidget):
                                      self.width(), self.height())
                 event.accept()
                 return
-            if not self.locked:
-                self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -702,9 +948,9 @@ class FileWidget(QWidget):
         self.resize(width, height)
 
     def _edge_at(self, pos):
-        """返回上下左右边缘/角落热区名称；不在热区内或已锁定时返回 None。"""
-        if self.locked:
-            return None
+        """返回上下左右边缘/角落热区名称；不在热区内时返回 None。"""
+        if not self._resizable:
+            return None                    # 扁平搜索条：不允许拖边缘改尺寸
         at_left = pos.x() < RESIZE_EDGE
         at_right = pos.x() >= self.width() - RESIZE_EDGE
         at_top = pos.y() < RESIZE_EDGE
@@ -744,6 +990,9 @@ class FileWidget(QWidget):
         for rect in peers or []:
             x_edges = (rect.x(), rect.x() + rect.width())
             y_edges = (rect.y(), rect.y() + rect.height())
+            # 吸附只改"被拖动的那条边"，对边必须钉住：
+            # 拖右缘时 left 不动、只改 width；拖下缘时 top 不动、只改 height。
+            # （若反过来改 left/top，用户会看到对面的边跟着一起动，很反常。）
             if "left" in edge:
                 for edge_x in x_edges:
                     if abs(left - edge_x) <= SNAP_DISTANCE:
@@ -756,7 +1005,7 @@ class FileWidget(QWidget):
             if "right" in edge:
                 for edge_x in x_edges:
                     if abs(left + width - edge_x) <= SNAP_DISTANCE:
-                        left = edge_x - width
+                        width = max(MIN_WIDGET_W, edge_x - left)
                         guide_top = min(top, rect.y())
                         guide_bottom = max(top + height, rect.y() + rect.height())
                         guides.append(QRect(edge_x, guide_top, 1,
@@ -774,7 +1023,7 @@ class FileWidget(QWidget):
             if "bottom" in edge:
                 for edge_y in y_edges:
                     if abs(top + height - edge_y) <= SNAP_DISTANCE:
-                        top = edge_y - height
+                        height = max(MIN_WIDGET_H, edge_y - top)
                         guide_left = min(left, rect.x())
                         guide_right = max(left + width, rect.x() + rect.width())
                         guides.append(QRect(guide_left, edge_y,
@@ -818,6 +1067,7 @@ class FileWidget(QWidget):
 
     def _apply_view_mode(self):
         """按当前预览方式与缩放档位设置列表视图参数。"""
+        self._guide_active = False         # 网格/紧凑布局覆盖引导布局
         if self.preview_icons:
             self.list_widget.setStyleSheet(LIST_QSS)
             self.list_widget.setViewMode(QListView.IconMode)
@@ -834,9 +1084,26 @@ class FileWidget(QWidget):
             self.list_widget.setGridSize(QSize())              # 恢复默认行高
             self.list_widget.setWordWrap(False)
             self.list_widget.setUniformItemSizes(False)
-            self.list_widget.setIconSize(QSize(16, 16))        # 左侧微小图标
+            self.list_widget.setIconSize(QSize(COMPACT_ICON_PX, COMPACT_ICON_PX))
+        if self._is_empty:                 # 空状态：网格/紧凑行都会挤坏引导文字
+            self._apply_guide_layout()     # 改走单列宽行（保留 gridSize 供缩放档位使用）
 
-    # ---------- 尺寸缩放（Ctrl+滚轮 / 右键"格子尺寸"） ----------
+    def _apply_guide_layout(self):
+        """空状态引导布局：换成单列宽行，避免引导文字被图标网格挤成竖排。
+
+        图标视图的单元格仅 76px 宽，长句会被强行折成 3~4 行竖排，观感破相；
+        改为列表模式后文字占满整行宽度，可正常换行显示。
+        只调整视图模式与换行策略，**刻意不动 gridSize/iconSize**：
+        网格尺寸是缩放档位的持久化依据，缩放切换与测试断言都依赖它保持不变。
+        """
+        if self._guide_active:                            # 已在引导布局：无需重复设置
+            return
+        self._guide_active = True
+        self.list_widget.setViewMode(QListView.ListMode)
+        self.list_widget.setWordWrap(True)               # 单列宽行：长提示可正常换行
+        self.list_widget.setUniformItemSizes(False)      # 引导条目高度按内容自适应
+
+    # ---------- 尺寸缩放（Ctrl+滚轮） ----------
 
     def _apply_scale(self, scale: float):
         """按缩放比应用图标/列宽与字号（窗口尺寸不变，内容自动重排；不刷新列表）。"""
@@ -863,23 +1130,6 @@ class FileWidget(QWidget):
         self.refresh()
         if self.on_zoom_changed is not None:
             self.on_zoom_changed(self, self.scale)
-
-    def _reset_scale(self):
-        """恢复默认尺寸（100%）。"""
-        if self.scale == 1.0:
-            return
-        self._apply_scale(1.0)
-        self.refresh()
-        if self.on_zoom_changed is not None:
-            self.on_zoom_changed(self, 1.0)
-
-    def _reset_window_size(self):
-        """窗口恢复默认大小（右键"尺寸调整"）。"""
-        if (self.width(), self.height()) == (WIDGET_WIDTH, WIDGET_HEIGHT):
-            return
-        self._apply_window_size(WIDGET_WIDTH, WIDGET_HEIGHT)
-        if self.on_size_changed is not None:
-            self.on_size_changed(self)
 
     def wheelEvent(self, event):
         """Ctrl+滚轮缩放格子（标题栏等空白区域同样生效）。"""
@@ -912,34 +1162,12 @@ class FileWidget(QWidget):
         if self.on_preview_changed is not None:
             self.on_preview_changed(self, icons)
 
-    def _show_zoom_menu(self, menu: QMenu):
-        """向右键菜单追加"尺寸调整"子菜单（图标缩放 + 窗口恢复默认）。"""
-        sub = menu.addMenu("尺寸调整")
-        info = sub.addAction(f"当前图标 {round(self.scale * 100)}%")
-        info.setEnabled(False)
-        sub.addSeparator()
-        sub.addAction("图标放大（Ctrl+滚轮上）", lambda: self._zoom(1))
-        sub.addAction("图标缩小（Ctrl+滚轮下）", lambda: self._zoom(-1))
-        sub.addAction("图标恢复默认大小", self._reset_scale)
-        sub.addSeparator()
-        sub.addAction("窗口恢复默认大小", self._reset_window_size)
-
-    # ---------- 位置锁定 ----------
-
-    def _set_locked(self, locked: bool):
-        """切换位置锁定状态并通知外部持久化（右键菜单调用）。"""
-        if locked == self.locked:
-            return
-        self.locked = locked
-        self._update_count_label()
-        if self.on_lock_changed is not None:
-            self.on_lock_changed(self, locked)
-
     # ---------- 文件列表 ----------
 
     def refresh(self):
         """重新读取收纳文件夹内容并刷新列表（文件夹在前、文件在后）。"""
         self.list_widget.clear()
+        self._thumb_items.clear()          # 列表已重建：旧的待回填条目全部作废
         try:
             names = sorted(os.listdir(self.folder), key=str.lower)
         except OSError:
@@ -950,20 +1178,25 @@ class FileWidget(QWidget):
             (dirs if os.path.isdir(full) else files).append((name, full))
         total = len(dirs) + len(files)
         self._update_count_label(total)
+        was_empty = self._is_empty                 # 记录刷新前状态：由空转非空需恢复布局
+        self._is_empty = (total == 0)
 
         if total == 0:                        # 空状态引导：主提示 + 可发现性提示
             main_tip = QListWidgetItem("拖入文件或文件夹即可收纳")
             main_tip.setFlags(Qt.NoItemFlags)
             main_tip.setTextAlignment(Qt.AlignCenter)
-            main_tip.setForeground(QBrush(QColor("#6a7080")))
+            main_tip.setForeground(QBrush(QColor("#8c96aa")))
             self.list_widget.addItem(main_tip)
-            hint = QListWidgetItem("右键空白处：新建 / 映射 / 锁定格子")
+            hint = QListWidgetItem("右键空白处：新建 / 映射 / 预览方式")
             hint.setFlags(Qt.NoItemFlags)
             hint.setTextAlignment(Qt.AlignCenter)
-            hint.setForeground(QBrush(QColor("#565c6c")))
+            hint.setForeground(QBrush(QColor(COLOR_TEXT_FAINT)))
             self.list_widget.addItem(hint)
+            self._apply_guide_layout()        # 切单列宽行：引导文字不再被网格挤成竖排
             return
 
+        if was_empty:                         # 由空转非空：撤销引导布局，回到预览方式
+            self._apply_view_mode()
         entries = dirs + files
         shown = entries[:MAX_LIST_ITEMS]
         for name, full in shown:
@@ -974,24 +1207,53 @@ class FileWidget(QWidget):
                 item.setTextAlignment(Qt.AlignHCenter)        # 图标与文字在单元格内水平居中
             else:
                 item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            icon = get_file_icon(full)        # 白页修复 + Shell 兜底 + 缓存
-            if not icon.isNull():
-                item.setIcon(icon)
+            self._set_item_icon(item, full)   # 图片走缩略图，其余走系统图标
             self.list_widget.addItem(item)
         if total > MAX_LIST_ITEMS:            # 超出上限时显示提示占位条目
             tip = QListWidgetItem(f"… 共 {total} 项，点右上角\"打开\"查看全部")
             tip.setFlags(Qt.NoItemFlags)      # 不可选中/双击
             self.list_widget.addItem(tip)
 
+    def _set_item_icon(self, item: QListWidgetItem, path: str):
+        """给条目设置图标：图片显示内容缩略图，其余显示 Windows 系统图标。
+
+        缩略图解码在后台线程：首次遇到某张图时先放系统图标占位，解码完成后
+        经 _on_thumb_ready 回填（命中缓存则立即显示）；非图片直接走 get_file_icon。
+        """
+        size = self._icon_px if self.preview_icons else COMPACT_ICON_PX
+        if is_thumbnailable(path):
+            image = get_thumbnail_service().get(path, size)
+            if image is not None:
+                item.setIcon(QIcon(QPixmap.fromImage(image)))
+                return
+            self._thumb_items[(path, size)] = item    # 等待后台解码回填
+        icon = get_file_icon(path)        # 白页修复 + Shell 兜底 + 缓存
+        if not icon.isNull():
+            item.setIcon(icon)
+
+    def _on_thumb_ready(self, path: str, size: int, image: QImage):
+        """缩略图后台解码完成：回填对应条目的图标（列表已重建则忽略）。"""
+        item = self._thumb_items.get((path, size))
+        if item is None or image.isNull():
+            return
+        item.setIcon(QIcon(QPixmap.fromImage(image)))
+
+    def closeEvent(self, event):
+        """关闭窗口时断开缩略图服务连接，避免全局服务无限累积失效回调。"""
+        try:
+            get_thumbnail_service().ready.disconnect(self._thumb_slot)
+        except (RuntimeError, TypeError):
+            pass                               # 未连接或已断开：静默忽略
+        super().closeEvent(event)
+
     def _update_count_label(self, total=None):
-        """更新标题旁的数量标签（含位置锁定状态）。"""
+        """更新标题旁的数量标签。"""
         if total is not None:
             self._item_total = total
-        suffix = "（已锁定）" if self.locked else ""
         if self._item_total:
-            self.count_label.setText(f"{self._item_total} 项{suffix}")
+            self.count_label.setText(f"{self._item_total} 项")
         else:
-            self.count_label.setText(suffix)
+            self.count_label.setText("")
 
     def _open_item(self, item):
         """双击列表项：用系统默认程序打开文件或文件夹。"""
@@ -1005,7 +1267,7 @@ class FileWidget(QWidget):
         open_in_shell(self.folder)
 
     def _show_menu(self, pos):
-        """右键菜单：条目操作 / 粘贴 / 外观与尺寸 / 格子管理 / 刷新 五个分区。
+        """右键菜单：条目操作 / 粘贴 / 外观 / 格子管理 / 刷新 五个分区。
 
         按使用频率分组：常用文件操作在前，格子管理在后，分隔线区分区块。
         """
@@ -1020,12 +1282,14 @@ class FileWidget(QWidget):
             self.list_widget.clearSelection()
             item.setSelected(True)            # 右键未选中条目时先选中它（支持多选批量操作）
         menu = QMenu(self)
+        # 右键菜单沿用全局玻璃配色：深底 + 浅白边 + 强调色选中块
         menu.setStyleSheet(
-            ("QMenu{background:#26282e;color:%s;border:1px solid #3a3d46;"
-             "border-radius:8px;padding:4px;}"
-             "QMenu::item{padding:5px 18px;border-radius:5px;}"
-             "QMenu::item:selected{background:rgba(76,194,255,70);}"
-             "QMenu::separator{height:1px;background:#3a3d46;margin:4px 6px;}"
+            ("QMenu{background:#1c1f26;color:%s;border:1px solid rgba(255,255,255,38);"
+             "border-radius:10px;padding:6px;}"
+             "QMenu::item{padding:6px 20px;border-radius:7px;}"
+             "QMenu::item:selected{background:rgba(255,255,255,60);color:#ffffff;}"
+             "QMenu::separator{height:1px;background:rgba(255,255,255,26);"
+             "margin:5px 8px;}"
              ) % COLOR_TEXT
         )
         if item is not None:
@@ -1033,10 +1297,16 @@ class FileWidget(QWidget):
             menu.addAction("打开", lambda: open_in_shell(path))
             menu.addAction("打开所在位置",
                            lambda: open_in_shell(os.path.dirname(path)))
-            menu.addSeparator()
             paths = [it.data(Qt.UserRole) for it in self.list_widget.selectedItems()
                      if it.flags() & Qt.ItemIsEnabled and it.data(Qt.UserRole)]
             suffix = f"（{len(paths)} 项）" if len(paths) > 1 else ""
+            # 重命名：与资源管理器一致，一次只处理一项（多项时置灰）
+            act_rename_item = menu.addAction(
+                "重命名（F2）", lambda: self._rename_paths(paths))
+            act_rename_item.setEnabled(len(paths) == 1)
+            if len(paths) != 1:
+                act_rename_item.setToolTip("一次只能重命名一项")
+            menu.addSeparator()
             menu.addAction(f"复制路径{suffix}", lambda: self._copy_paths(paths))
             menu.addAction(f"剪切{suffix}", lambda: self._cut_paths(paths))
             menu.addAction(f"删除到回收站{suffix}",
@@ -1051,18 +1321,15 @@ class FileWidget(QWidget):
             act_paste.setToolTip("先在有内容的格子上右键选择“剪切”")
         menu.addSeparator()
         menu.addAction("打开文件夹", self._open_folder)
-        self._show_preview_menu(menu)
-        self._show_zoom_menu(menu)
-        act_lock = menu.addAction("锁定位置")
-        act_lock.setCheckable(True)
-        act_lock.setChecked(self.locked)
-        act_lock.toggled.connect(self._set_locked)
+        if not self._bar_mode:              # 扁平搜索条固定单列显示，无需预览方式
+            self._show_preview_menu(menu)
         menu.addSeparator()
         act_rename = menu.addAction("重命名格子…")
-        if self.title in BUILTIN_GRID_NAMES or self.title == SEARCH_GRID_TITLE:
+        if self.grid_key == SEARCH_GRID_TITLE:
             act_rename.setEnabled(False)
-            act_rename.setToolTip("内置分类/搜索格子不可重命名")
+            act_rename.setToolTip("搜索格子不可重命名")
         else:
+            # 内置分类同样可改名：只改显示名，分类键与文件夹保持不变
             act_rename.triggered.connect(
                 lambda: self.on_rename_grid(self) if self.on_rename_grid else None)
         menu.addAction("新建格子…",
@@ -1103,6 +1370,31 @@ class FileWidget(QWidget):
             move_to_recycle_bin(path)
         self.refresh()
 
+    def _rename_paths(self, paths):
+        """就地重命名选中的文件/文件夹（与资源管理器一致：一次只能一项）。
+
+        名称非法、目标已存在、被占用等情况弹窗提示；**绝不覆盖**已有文件。
+        """
+        paths = [p for p in paths if p]
+        if len(paths) != 1:
+            QMessageBox.information(self, "重命名", "一次只能重命名一项。")
+            return
+        path = paths[0]
+        old_name = os.path.basename(path)
+        new_name, ok = QInputDialog.getText(
+            self, "重命名", "新名称：", text=old_name)
+        if not ok:
+            return
+        new_name = new_name.strip()
+        if not new_name or new_name == old_name:
+            return                       # 未改动：不碰文件系统
+        try:
+            rename_entry(path, new_name)
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "无法重命名", str(exc))
+            return
+        self.refresh()                   # 名称已变：重建列表显示新名字
+
     # ---------- 文件/文件夹拖入 ----------
 
     def dragEnterEvent(self, event):
@@ -1142,13 +1434,14 @@ class FileWidget(QWidget):
 
 
 class SearchWidget(FileWidget):
-    """桌面搜索格子：常驻桌面、可随时删除，输入关键词搜索收纳库与路径映射文件夹。
+    """桌面搜索条：平时只有"一个搜索框"的高度，输入关键词后向下展开结果。
 
     - 输入防抖 300ms；支持拼音搜索（organizer.search_storage 内置）；
     - 配 search_service 时搜索在后台线程执行，结果经序号+关键词双重校验回填；
       未配置 service 时退化为前台同步搜索（保持旧行为，便于测试兜底）；
-    - 结果条目双击打开，右键可打开所在位置/复制路径/剪切（配合目标格子粘贴移动）；
-    - 位置/尺寸/图标缩放/锁定等记忆完全复用 FileWidget 的机制（键名固定为"搜索"）。
+    - 关键词为空或没有结果时自动收起，重新变回"只有一个搜索框"的扁平形态；
+    - 结果固定用单列列表显示（行高可预测，便于据此计算展开高度）；
+    - 只保留拖动与位置记忆（键名固定为"搜索"），不允许拖边缘改尺寸。
     """
 
     def __init__(self, on_search, *args, **kwargs):
@@ -1156,13 +1449,22 @@ class SearchWidget(FileWidget):
         self._service = kwargs.pop("search_service", None)
         self._search_ready = False
         self._search_seq = 0               # 最近一次提交给后台的请求序号
+        self._result_rows = 0              # 当前展开显示的结果行数（决定窗口高度）
         super().__init__(*args, **kwargs)
-        self.title_label.setText(SEARCH_GRID_TITLE)
-        self.count_label.setText("")
-        self.setAcceptDrops(False)                     # 搜索格子不接受拖入
+        self._bar_mode = True              # 扁平形态：不画标题分隔线
+        self._resizable = False            # 扁平搜索条：不允许拖边缘调整尺寸
+        # 扁平化外观：隐藏标题栏、计数与"打开"按钮，只留输入框
+        self.title_label.hide()
+        self.count_label.hide()
+        self.open_btn.hide()
+        self.layout().setContentsMargins(8, 6, 8, 6)
+        self.setAcceptDrops(False)         # 搜索条不接受拖入
         self.search_edit = QLineEdit(self)
-        self.search_edit.setPlaceholderText("输入关键词搜索（支持拼音）")
-        self.layout().insertWidget(1, self.search_edit)
+        self.search_edit.setPlaceholderText("搜索收纳库（支持拼音）")
+        self.search_edit.setStyleSheet(SEARCH_EDIT_QSS)
+        self.layout().insertWidget(1, self.search_edit)   # 输入框放在标题栏与列表之间
+        self.layout().setStretch(1, 0)     # 输入框只占自身高度，不参与纵向拉伸
+        self.layout().setStretch(2, 1)     # 结果列表吃掉展开出来的空间
         if self._service is not None:
             self._service.results_ready.connect(self._on_results)
         self._search_timer = QTimer(self)
@@ -1171,7 +1473,44 @@ class SearchWidget(FileWidget):
         self.search_edit.textChanged.connect(
             lambda _text: self._search_timer.start(300))
         self._search_ready = True
+        self._apply_bar_height()           # 初始态：无结果，只有搜索框高度
         self.refresh()
+
+    def _apply_window_size(self, width: int, height: int):
+        """扁平搜索条：高度由"搜索框 + 结果行数"决定，不走通用尺寸记忆与钳制。"""
+        self.resize(SEARCH_BAR_WIDTH, SEARCH_BAR_HEIGHT)
+
+    def set_preview(self, icons: bool):
+        """搜索条固定用单列列表展示结果：忽略"图标视图"，避免结果被排成网格。"""
+        super().set_preview(False)
+
+    def _bar_base_height(self) -> int:
+        """纯搜索条的高度 = 上下边距 + 输入框的自然高度。"""
+        margins = self.layout().contentsMargins()
+        return (margins.top() + margins.bottom()
+                + self.search_edit.sizeHint().height())
+
+    def _apply_bar_height(self):
+        """按结果行数决定窗口高度：无结果=只有搜索框，有结果=向下展开显示结果。"""
+        rows = min(self._result_rows, SEARCH_RESULT_MAX_ROWS)
+        if rows <= 0:                      # 无结果：收起列表，只剩输入框
+            self.list_widget.hide()
+            height = self._bar_base_height()
+        else:
+            self.list_widget.show()
+            row_h = self.list_widget.sizeHintForRow(0)
+            if row_h <= 0:                 # 列表尚未布局：用估算行高兜底
+                row_h = SEARCH_RESULT_ROW_H
+            margins = self.layout().contentsMargins()
+            height = (self._bar_base_height() + self.layout().spacing()
+                      + rows * row_h + margins.bottom())
+        if self.height() != height:
+            self.resize(self.width(), height)
+
+    def _set_result_rows(self, rows: int):
+        """更新结果行数并据此调整窗口高度（0 = 收起为纯搜索条）。"""
+        self._result_rows = max(0, int(rows))
+        self._apply_bar_height()
 
     def refresh(self):
         """刷新 = 用当前关键词重跑搜索（存储变动/重建格子时自动保持最新）。"""
@@ -1181,20 +1520,17 @@ class SearchWidget(FileWidget):
         self._run_search()
 
     def _run_search(self):
-        """执行搜索并填充结果列表（有后台服务时改为提交请求）。"""
+        """执行搜索并填充结果（有后台服务时改为提交请求，结果回来再展开）。"""
         keyword = self.search_edit.text().strip()
         self.list_widget.clear()
-        if not keyword:
-            self.count_label.setText("")
-            tip = QListWidgetItem("输入关键词搜索收纳库（支持拼音）")
-            tip.setFlags(Qt.NoItemFlags)
-            tip.setTextAlignment(Qt.AlignCenter)
-            tip.setForeground(QBrush(QColor("#6a7080")))
-            self.list_widget.addItem(tip)
+        self._thumb_items.clear()
+        self.count_label.setText("")
+        if not keyword:                      # 关键词为空：收起结果区（只剩搜索框）
+            self._set_result_rows(0)
             return
         if self._service is not None:
             self._search_seq = self._service.start(keyword, MAX_LIST_ITEMS)
-            self.count_label.setText("搜索中…")
+            self._set_result_rows(0)         # 搜索中：先收起，结果回来再展开
         else:
             self._fill_results(self._on_search(keyword) or [])
 
@@ -1205,22 +1541,17 @@ class SearchWidget(FileWidget):
         self._fill_results(results or [])
 
     def _fill_results(self, results: list):
-        """把搜索结果填充到列表并更新计数。"""
+        """把搜索结果填充到列表：固定单列、一行一条，并按结果条数展开窗口。"""
+        results = results or []
         self.count_label.setText(f"{len(results)} 项")
         for category, path in results[:MAX_LIST_ITEMS]:
-            if self.preview_icons:
-                # 图标视图单元格较窄，只显示名称（分类信息看 tooltip）
-                item = QListWidgetItem(os.path.basename(path))
-            else:
-                # 紧凑列表单行宽裕，行尾带分类标签方便区分同名文件
-                item = QListWidgetItem(f"{os.path.basename(path)}（{category}）")
+            # 单列列表行宽裕，行尾带分类标签方便区分同名文件
+            item = QListWidgetItem(f"{os.path.basename(path)}（{category}）")
             item.setData(Qt.UserRole, path)
             item.setToolTip(f"[{category}] {path}")
-            if self.preview_icons:
-                item.setTextAlignment(Qt.AlignHCenter)
-            else:
-                item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             icon = get_file_icon(path)
             if not icon.isNull():
                 item.setIcon(icon)
             self.list_widget.addItem(item)
+        self._set_result_rows(min(len(results), MAX_LIST_ITEMS))

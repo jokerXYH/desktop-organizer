@@ -135,6 +135,23 @@ def test_rename_grid_rejects_bad_name(ctx):
     assert "资料夹" in ctx.config["categories"]             # 失败后配置不变
 
 
+def test_rename_builtin_category_changes_display_name_only(ctx):
+    """内置分类改名：只改显示名，分类键与收纳库文件夹保持不变。"""
+    root = ctx.config["storageRoot"]
+    assert ctx.rename_grid("文档", "资料") == ""
+
+    assert "文档" in ctx.config["categories"]               # 分类键不变（自动整理依赖它）
+    assert os.path.isdir(os.path.join(root, "文档"))         # 文件夹不变
+    assert ctx.config["gridTitles"]["文档"] == "资料"        # 仅显示名改变
+
+    doc = next(w for w in ctx.widgets if w.title == "资料")
+    assert doc.grid_key == "文档"                           # 记忆键仍是内置键
+    assert "已存在" in ctx.rename_grid("资料", "图片")       # 与其它内置分类显示名重名被拒
+
+    ctx.rebuild_widgets()                                   # 重启后显示名保持
+    assert any(w.title == "资料" for w in ctx.widgets)
+
+
 def test_panel_geometry_persist(ctx):
     """面板几何记忆：保存后写入配置，可被 parse 还原。"""
     ctx.panel.move(100, 120)
@@ -164,8 +181,9 @@ def test_grid_zoom_and_size_persist(ctx):
     assert doc2.scale == 1.15
     assert doc2.list_widget.gridSize().height() == scale_geometry(1.15)["cell_h"]
 
-    doc2._reset_scale()
-    doc2._reset_window_size()
+    doc2._zoom(-1)                                # Ctrl+滚轮缩小回 100% 并持久化
+    doc2._apply_window_size(270, 360)             # 拖拽边缘缩回默认尺寸
+    doc2._emit_size()
     assert doc2.scale == 1.0
     assert (doc2.width(), doc2.height()) == (270, 360)
     assert ctx.config["widgetScales"]["文档"] == 1.0
@@ -375,6 +393,49 @@ def test_auto_organize_duplicate_guard(ctx, tmp_path, monkeypatch):
     assert "重复" in ctx.panel.status_label.text()
 
 
+def test_auto_organize_guard_restored_from_history(ctx, tmp_path, monkeypatch):
+    """同名保护跨重启：开启自动整理时从撤销历史恢复保护名单。
+
+    释放源反复释放 + 应用重启（保护名单原存内存会丢失）的场景：
+    guard 窗口内有该名字的移动记录 → 再现时跳过；窗口外的记录不设防。
+    """
+    from datetime import datetime, timedelta
+
+    desktop = tmp_path / "fake_desktop"
+    desktop.mkdir()
+    monkeypatch.setattr(org, "get_desktop_path", lambda: str(desktop))
+    root = ctx.config["storageRoot"]
+    now = datetime.now()
+    # 模拟"上一个进程"留下的历史：5 分钟前收纳过 "资料"，2 小时前收纳过 "旧释放"
+    # （注意 dst 是被移动的条目本身——文件夹收纳时 dst 即文件夹路径）
+    cfg.append_records([
+        {"src": str(desktop / "资料"),
+         "dst": os.path.join(root, "文件夹", "资料"),
+         "batch": "b1",
+         "time": (now - timedelta(minutes=5)).isoformat(timespec="seconds")},
+        {"src": str(desktop / "旧释放"),
+         "dst": os.path.join(root, "文件夹", "旧释放"),
+         "batch": "b2",
+         "time": (now - timedelta(hours=2)).isoformat(timespec="seconds")},
+    ])
+
+    ctx.set_auto_organize(True)                   # 启动恢复：从历史加载保护名单
+    recent = desktop / "资料"                     # 释放方再次释放同名文件夹
+    recent.mkdir()
+    (recent / "b.txt").write_text("b", encoding="utf-8")
+    stale = desktop / "旧释放"                     # 超过窗口的同名再现：正常收纳
+    stale.mkdir()
+    (stale / "c.txt").write_text("c", encoding="utf-8")
+
+    ctx._run_auto_organize()
+    assert "重复" in ctx.panel.status_label.text()     # 保护提示已发出
+    ctx._confirm_and_collect()
+
+    assert (recent / "b.txt").exists()            # 窗口内：被保护跳过
+    assert not os.path.exists(os.path.join(root, "文件夹", "资料", "b.txt"))
+    assert os.path.exists(os.path.join(root, "文件夹", "旧释放", "c.txt"))
+
+
 def test_search_grid(ctx):
     """搜索格子：默认存在、支持拼音搜索（后台提交+结果回填）、删除后消失、可恢复。"""
     search = next(w for w in ctx.widgets if w.title == "搜索")
@@ -384,8 +445,9 @@ def test_search_grid(ctx):
         handle.write("x")
 
     search.search_edit.setText("jidu")             # 拼音（季度）
-    search._run_search()                           # 提交后台请求，先显示"搜索中…"
-    assert "搜索中" in search.count_label.text()
+    search._run_search()                           # 提交后台请求：结果回来前保持收起
+    assert search.list_widget.count() == 0         # 无结果时列表收起（只剩搜索框）
+
     ctx.search_service.results_ready.emit(
         search._search_seq, "jidu", ctx.search_service.run_now("jidu", 200))
 
@@ -599,25 +661,23 @@ def test_auto_organize_tray_panel_sync(ctx):
 
 
 def test_search_results_category_tag(ctx):
-    """搜索结果：图标视图只显示名称；紧凑列表行尾带分类标签。"""
+    """搜索结果固定单列显示：行尾带分类标签，且不会被"预览方式"排成网格。"""
+    from PySide6.QtWidgets import QListView
+
     search = next(w for w in ctx.widgets if w.title == "搜索")
     path = os.path.join(ctx.config["storageRoot"], "文档", "报告.docx")
 
-    # 图标视图：走真实提交流程再回填
     search.search_edit.setText("报告")
     search._search_timer.stop()
     search._run_search()
     ctx.search_service.results_ready.emit(
         search._search_seq, "报告", [("文档", path)])
     assert search.list_widget.count() == 1
-    assert search.list_widget.item(0).text() == "报告.docx"   # 单元格窄，仅名称
+    assert search.list_widget.item(0).text() == "报告.docx（文档）"
 
-    # 紧凑列表：行尾带分类标签
-    search._switch_preview(False)
-    ctx.search_service.results_ready.emit(
-        search._search_seq, "报告", [("文档", path)])
-    assert search.list_widget.count() == 1
-    assert "（文档）" in search.list_widget.item(0).text()
+    # 搜索条忽略"图标视图"：切换后仍是单列列表
+    search.set_preview(True)
+    assert search.list_widget.viewMode() == QListView.ListMode
 
 
 def test_empty_grid_guide_hint(ctx):
@@ -645,3 +705,144 @@ def test_resize_hot_zone_widened(ctx):
     doc = next(w for w in ctx.widgets if w.title == "文档")
     assert doc._edge_at(QPoint(7, 180)) == "left"    # 7px 处仍是热区（原 6px 不在）
     assert doc._edge_at(QPoint(135, 180)) is None    # 中部空白仍是拖动窗口区
+
+
+# ---------- v2.7.2 自动整理与搜索线程修复回归 ----------
+
+def test_auto_organize_skipped_by_switch_not_marked_collected(ctx, tmp_path, monkeypatch):
+    """因收录开关关闭而跳过的条目不能被当成"已收纳"：打开开关后仍能收。
+
+    旧实现把 set(stable)-set(failed) 全当成功，文件夹被误入已收纳名单与
+    基线，用户之后打开"收录文件夹"开关时它已不在"新条目"里，永久不再收纳。
+    """
+    desktop = tmp_path / "fake_desktop"
+    desktop.mkdir()
+    monkeypatch.setattr(org, "get_desktop_path", lambda: str(desktop))
+    ctx.config["includeFolders"] = False          # 文件夹收录开关关闭
+    ctx.set_auto_organize(True)
+
+    folder = desktop / "资料"
+    folder.mkdir()
+    (folder / "a.txt").write_text("a", encoding="utf-8")
+
+    ctx._run_auto_organize()
+    ctx._confirm_and_collect()
+
+    root = ctx.config["storageRoot"]
+    assert folder.is_dir()                                   # 有意留在桌面
+    assert not os.path.exists(os.path.join(root, "文件夹", "资料"))
+    assert "资料" not in ctx._auto_collected                 # 未误记为已收纳
+    assert "资料" not in ctx._auto_seen                      # 也未入基线
+    assert "资料" not in ctx._auto_stable                    # 已撤出待确认
+
+    ctx.config["includeFolders"] = True           # 用户随后打开开关
+    ctx._run_auto_organize()
+    ctx._confirm_and_collect()
+    assert os.path.exists(os.path.join(root, "文件夹", "资料", "a.txt"))
+
+
+def test_auto_organize_detects_deep_folder_writes(ctx, tmp_path, monkeypatch):
+    """子目录里继续落文件也应判为"还在变化"：文件夹稳定性需递归计数。
+
+    只数顶层条目时，往已存在的子目录里拷贝文件既不改变顶层条目数、
+    也不改变顶层目录 mtime（目录 mtime 只随本层增删改名更新），
+    半拷贝的文件夹会被误判为已稳定而整体搬走 → 释放方重建产生副本。
+    """
+    desktop = tmp_path / "fake_desktop"
+    desktop.mkdir()
+    monkeypatch.setattr(org, "get_desktop_path", lambda: str(desktop))
+    ctx.set_auto_organize(True)
+
+    folder = desktop / "半拷贝"
+    sub = folder / "子目录"
+    sub.mkdir(parents=True)
+    (sub / "a.bin").write_text("a", encoding="utf-8")
+
+    ctx._run_auto_organize()                      # 进入确认（快照含 a.bin）
+    (sub / "b.bin").write_text("b", encoding="utf-8")   # 顶层条目数与 mtime 均不变
+
+    ctx._confirm_and_collect()
+    root = ctx.config["storageRoot"]
+    assert not os.path.exists(os.path.join(root, "文件夹", "半拷贝"))  # 未搬走
+    assert folder.is_dir()
+    assert "半拷贝" in ctx._auto_stable            # 仍在待确认，继续观察
+
+
+def test_auto_organize_guard_uses_src_name_on_collision(ctx, tmp_path, monkeypatch):
+    """同名保护名单按 src（桌面原名）重建：dst 带" (2)"时取名字会错位。
+
+    收纳库已有"资料"时再次收纳的同名条目 dst 会变成"资料 (2)"，
+    用 dst 的 basename 建名单就与桌面上真实再现的"资料"对不上，保护失效。
+    """
+    from datetime import datetime, timedelta
+
+    desktop = tmp_path / "fake_desktop"
+    desktop.mkdir()
+    monkeypatch.setattr(org, "get_desktop_path", lambda: str(desktop))
+    root = ctx.config["storageRoot"]
+    cfg.append_records([{
+        "src": str(desktop / "资料"),
+        "dst": os.path.join(root, "文件夹", "资料 (2)"),   # 冲突改名后的目标
+        "batch": "b1",
+        "time": (datetime.now() - timedelta(minutes=5)).isoformat(
+            timespec="seconds"),
+    }])
+
+    ctx.set_auto_organize(True)                   # 启动恢复保护名单
+    assert "资料" in ctx._auto_collected          # 用 src 取到的名字
+
+    recent = desktop / "资料"
+    recent.mkdir()
+    (recent / "b.txt").write_text("b", encoding="utf-8")
+    ctx._run_auto_organize()
+    assert "重复" in ctx.panel.status_label.text()     # 同名保护生效
+
+
+def test_grid_dirs_provider_returns_snapshot(ctx):
+    """路径映射提供者返回快照拷贝：后台搜索线程迭代不会踩到主线程的增删。"""
+    external = os.path.join(os.path.dirname(ctx.config["storageRoot"]), "外部")
+    os.makedirs(external, exist_ok=True)
+    ctx.create_grid("映射A", folder=external)
+
+    snapshot = ctx._snapshot_grid_dirs()
+    assert ("映射A", external) in snapshot
+    assert isinstance(snapshot, list)
+
+    ctx.remove_grid("映射A")
+    # 旧快照是独立拷贝：不随之后的增删变化（后台线程可安心迭代）
+    assert ("映射A", external) in snapshot
+    assert all(name != "映射A" for name, _path in ctx._snapshot_grid_dirs())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="大小写不敏感仅 Windows 文件系统")
+def test_storage_change_path_case_insensitive(ctx, monkeypatch):
+    """事件源路径与格子记录的路径大小写不同也必须命中（用同一归一化尺子）。"""
+    root = ctx.config["storageRoot"]
+    doc = next(w for w in ctx.widgets if w.title == "文档")
+    hits = []
+    monkeypatch.setattr(doc, "refresh", lambda: hits.append(1))
+
+    ctx._on_storage_changed(os.path.join(root, "文档").upper())
+    ctx._refresh_timer.stop()
+    ctx._refresh_pending()
+    assert hits == [1]
+
+
+def test_organize_reports_oserror_instead_of_crashing(ctx, monkeypatch):
+    """一键整理遇到 OSError（如建分类目录失败）应弹提示，而非异常逃出槽函数。"""
+    from PySide6.QtWidgets import QMessageBox
+
+    ctx.config["confirmOrganize"] = False         # 跳过预览，直接走整理分支
+
+    def boom(*_args, **_kwargs):
+        raise OSError("磁盘只读")
+
+    monkeypatch.setattr(org, "organize_desktop", boom)
+    messages = []
+    monkeypatch.setattr(QMessageBox, "critical",
+                        staticmethod(lambda parent, title, text:
+                                     messages.append(text)))
+
+    ctx.panel._do_organize()                      # 不应抛异常
+
+    assert messages and "磁盘只读" in messages[0]

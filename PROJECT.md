@@ -6,7 +6,7 @@
 ## 1. 项目是什么
 
 Windows 桌面文件整理工具（Python + PySide6，独立自研）：
-当前版本 v2.6.0，版本历史见仓库根的 CHANGELOG.md。
+当前版本 v2.9.0，版本历史见仓库根的 CHANGELOG.md。
 - 桌面右侧悬浮一排**分类格子窗口**（无边框、半透明、置底、不抢任务栏）
 - 一键整理：把桌面顶层文件/文件夹按扩展名分类移入收纳库
 - 拖拽：把任意文件/文件夹拖进格子即移入对应分类文件夹
@@ -27,18 +27,22 @@ Windows 桌面文件整理工具（Python + PySide6，独立自研）：
 | 项目目录 | 本仓库根目录 |
 | ⚠ 注册表自启项 | HKCU Run 键 `MyDeskOrganizer` 指向 main.py；如不再使用，请删除该键 |
 
-## 3. 模块与职责（共 6 个源文件）
+## 3. 模块与职责（共 8 个源文件）
 
 ```
 项目根目录\
-├── main.py            程序入口：AppContext / 托盘 / F7 热键 / 文件监听 / 位置与自启编排
-├── config.py          配置与历史 JSON 持久化（纯逻辑，无 GUI 依赖）
+├── main.py            程序入口：AppContext / 托盘 / F7-F9 热键 / 文件监听 / 位置与自启编排
+├── config.py          配置与历史 JSON 持久化 + app_dir()（纯逻辑，无 GUI 依赖）
 ├── organizer.py       分类/整理/撤销/拖入移动/收纳库搜索（纯逻辑，无 GUI 依赖）
+├── shortcut.py        桌面/开始菜单快捷方式生成（纯逻辑，无 GUI 依赖）
 ├── widgets.py         FileWidget 桌面格子窗口（图标、预览切换、位置记忆、暗色绘制）
 ├── control_panel.py   ControlPanel 控制面板（按钮、开关、搜索、暗色 QSS）
 ├── autostart.py       HKCU Run 键读写（纯 winreg，便于测试）
+├── search_service.py  收纳库搜索后台线程服务（面板与搜索格子共享）
+├── assets\            app_icon.ico（快捷方式与打包 exe 共用）
+├── tools\             make_readme_screenshots.py / make_app_icon.py / build_exe.py
 ├── requirements.txt   PySide6 + pytest
-└── tests\             conftest.py + 5 个测试文件，共 80 用例（含 GUI/集成冒烟）
+└── tests\             conftest.py + 8 个测试文件，共 139 用例（含 GUI/集成冒烟）
 ```
 
 ## 4. organizer.py（核心逻辑层）
@@ -137,6 +141,8 @@ set_autostart(script_path, enable)   # KEY_SET_VALUE 写 REG_SZ / DeleteValue；
 WIDGET_WIDTH=270  WIDGET_HEIGHT=360  BG_ALPHA=232  CORNER_RADIUS=14  TITLE_BAR_HEIGHT=36
 ICON_SIZE=32  GRID_CELL_W=78  GRID_CELL_H=74
 MAX_LIST_ITEMS=200          # 大目录防卡：超出只渲染 200 条 + 一条"… 共 N 项"提示（Qt.NoItemFlags）
+COMPACT_ICON_PX=24          # 紧凑列表左侧图标/缩略图边长
+THUMB_EXTS / THUMB_MAX_SRC_BYTES=40MB / THUMB_CACHE_MAX=500  # 缩略图准入与缓存上限
 POSITION_SAVE_DELAY_MS=600  # 位置保存防抖
 COLOR_BG=QColor(28,30,36,232)  COLOR_BORDER=#404450  COLOR_TEXT="#e8eaed"  COLOR_ACCENT="#4cc2ff"
 ```
@@ -158,10 +164,10 @@ FileWidget(title, folder, on_drop,
 
 ### 7.3 关键行为
 
-- **图标**：全局单例 `get_icon_provider()`（QFileIconProvider），仅图标模式取 `provider.icon(QFileInfo(path))`；紧凑模式不取图标（省资源）。列表按"文件夹在前、文件在后"排序（均 `key=str.lower`）。
+- **图标**：全局单例 `get_icon_provider()`（QFileIconProvider）；紧凑模式不取系统图标。**图片条目优先显示内容缩略图**：`ThumbnailService` 单例把解码放到后台线程池，按 `(路径, mtime, 边长)` 缓存，完成后经 `ready` 信号回填条目；非图片/超 40MB 的图走系统图标兜底。列表按"文件夹在前、文件在后"排序（均 `key=str.lower`）。
 - **预览切换 `set_preview(icons)`**：
-  - 图标视图：`IconMode` + IconSize 32 + GridSize 78x74 + WordWrap + `Adjust` + `LayoutMode Batched`(batchSize 50)
-  - 紧凑列表：`ListMode` + `setGridSize(QSize())` 复位 + 不取图标
+  - 图标视图：`IconMode` + IconSize 38 + GridSize 76x84 + WordWrap + `Adjust` + `LayoutMode Batched`(batchSize 50)
+  - 紧凑列表：`ListMode` + `setGridSize(QSize())` 复位 + IconSize 24（左侧小缩略图）
 - **位置记忆**：`showEvent` 置 `_position_ready=True`（首次 show 前不保存，避免覆盖记忆值）；`mouseMoveEvent` 拖动时 `_pos_timer.start(600)`；到期 `_emit_position()` 回调；`hideEvent` 若定时器活跃则立即停表并回调一次。
 - **右键菜单**（暗色 QSS 内联）：条目上 → 打开/打开所在位置；任意位置 → 打开文件夹 / "预览方式"子菜单（QActionGroup 互斥：图标视图/紧凑列表）/ 刷新。
 - **拖放**：`dragEnterEvent` 有 urls 即 accept；`dropEvent` 收集 `toLocalFile()` 且 `os.path.exists` 的路径 → `on_drop(paths, self)`。
@@ -212,10 +218,10 @@ APP_QSS  # 全局暗色 QMenu / QToolTip（"分"字圆角托盘图标 make_tray_
 - `handle_drop(paths, widget)`：batch=uuid4().hex[:12]，逐个 `org.move_into`（捕获 OSError/shutil.Error/ValueError 计失败），成功记录 MoveRecord 入 history 并 `widget.refresh()`；状态栏报成功/失败数。
 - `main()`：`setQuitOnLastWindowClosed(False)` → 建 ctx → 注册热键 → 托盘菜单（控制面板 / 显示隐藏格子(F7) / 游戏模式(checkable) / 退出）→ `rebuild_widgets()` → 若 config gameMode=True 则保持游戏模式（面板不弹），否则 `show_panel()` → `app.aboutToQuit.connect(save_all_positions)` → exec 后 UnregisterHotKey。
 
-## 10. 测试基线（80 用例，必须全绿）
+## 10. 测试基线（143 用例，必须全绿）
 
 ```bash
-python -m pytest tests/ -q    # 期望 80 passed
+python -m pytest tests/ -q    # 期望 143 passed
 ```
 
 - `tests/conftest.py`：仅把项目根插入 sys.path。
@@ -559,3 +565,296 @@ python -m pytest tests/ -q    # 期望 80 passed
 ### 新增测试（合计 99）
 - test_auto_organize_waits_for_stability / skips_in_progress_names /
   locked_file_retries / gives_up_after_max_attempts / duplicate_guard。
+
+补充（同日）：`_load_auto_collected()` 从撤销历史恢复同名保护名单
+（窗口内有该名字移动记录 → 再现时跳过），`set_auto_organize(True)` 与
+`_sync_auto_watcher` 重挂监听时调用——应用重启后保护不丢。
+新增 test_auto_organize_guard_restored_from_history（合计 100）。
+
+## 22. v2.7.2 健壮性修复与界面视觉精修（2026-10-14）
+
+### 修复的缺陷（含第 21 节遗留的"深层缺口"）
+1. **深层缺口已关闭**（原第 21 节列为"仍依赖同名保护兜底"）：文件夹稳定性
+   快照改为**递归**条目数 + `mtime_ns`。此前只数顶层条目、且 `int(st_mtime)`
+   秒级截断，往已存在的子目录里落文件时快照不变 → 半拷贝文件夹被整体搬走 →
+   释放方重建副本。递归计数有上限 `AUTO_DIR_SCAN_CAP=500`，超大目录提前结束。
+2. **同名保护名单改用 `src` 取名**：`dst` 因冲突改名（"名 (2)"）会与桌面
+   真实名字错位。涉及 `_load_auto_collected`。
+3. **`organize_desktop` 新增 `skipped` 返回值**（`return_failed=True` 时返回
+   三元组 `(records, failed, skipped)`）：开关关闭而有意留下的条目不再被
+   自动整理误记为"已收纳"；自动整理对 skipped 撤出待确认但不记入
+   `_auto_collected`、不入基线（`_confirm_and_collect` 与末尾基线两处）。
+   调用方 `control_panel._do_organize` 同步改为三元组解包。
+4. **路径映射并发安全**：`AppContext._grid_lock` + `_snapshot_grid_dirs()`；
+   搜索服务 `dirs_provider` 改为该方法。`create_grid/rename_grid/remove_grid`
+   的 gridPaths 改动都在锁内。
+5. **`control_panel._do_organize` 捕获 `(RuntimeError, OSError)`**。
+6. **`organizer.is_within` 比较前 `os.path.normcase`**（Windows 大小写不敏感）。
+7. **`main._norm_dir()`** 统一 `_on_storage_changed` 与 `_refresh_pending`
+   的路径归一化，修正大小写/尾分隔符不一致导致的漏刷。
+8. `AppContext._forget_pending(name)`：抽出"从 `_auto_stable`/`_auto_rounds`
+   移除"的重复片段（原 5 处重复 pop 对）。
+
+### 界面视觉精修（玻璃拟态）
+统一"深底 + 浅白描边 + 半透明层叠"的玻璃语言，仅改配色/圆角/间距/字体层级
+与悬停选中态，**布局结构、控件层级、信号连接、几何计算与业务逻辑零变更**。
+
+| 位置 | 改动要点 |
+| --- | --- |
+| `widgets.FileWidget.paintEvent` | 分层绘制：竖向渐变基底（上亮下暗）→ 顶部高光渐隐 → 浅白外描边 → 更淡内高光描边（玻璃"厚度"）→ 标题分隔线两端渐隐 |
+| `widgets` 外观常量 | `CORNER_RADIUS` 14→16、`BG_ALPHA` 232→208（更透，透出壁纸成毛玻璃）；新增 `COLOR_BG_BOTTOM`/`COLOR_GLOW`/`COLOR_INNER_HIGHLIGHT`/`COLOR_SEPARATOR`/`COLOR_TEXT_DIM`/`COLOR_TEXT_FAINT` |
+| `widgets.LIST_QSS` / `COMPACT_LIST_QSS` | 悬停 16、选中强调色 52 加半透明强调描边；滚动条滑块半透明浅白、悬停转主题色；紧凑列表行距再放宽 |
+| `widgets.SEARCH_EDIT_QSS`（新增） | 搜索格子输入框原先无样式会退回系统浅色默认外观，现统一为玻璃输入框（含聚焦描边） |
+| `widgets` 标题栏 | "打开"改为胶囊形文字按钮 + 悬停浅蓝底；计数标签改用 `COLOR_TEXT_DIM` |
+| `control_panel.PANEL_QSS` | 底色 #15181f；按钮/输入框/下拉框/列表改半透明浅底 + 浅白描边 + 9~10px 圆角；主按钮改上下渐变 + 深色文字 |
+| `control_panel.GlassCheckBox`（新增） | 自绘指示器：选中=主题蓝圆角块 + 深色对勾，未选中=半透明玻璃方块（悬停提亮）；仅覆盖绘制，`isChecked/toggled` 不变 |
+| `main.APP_QSS` | 右键菜单/工具提示/对话框同步玻璃配色（10px 圆角 + 浅白描边 + 强调色选中块） |
+| `main.make_tray_icon` | 渐变圆角块 + 内高光描边 |
+
+### 实机验证（真机复核）
+
+方法：真机（显示缩放 2.0，物理 2880×1800）上用 `PrintWindow`（`SetProcessDPIAware`
+后）直接抓取"置底"格子的窗口内容——置底窗常被最大化窗口遮挡，`PrintWindow`
+可绕开遮挡取证且不打扰其它窗口；面板另用 `WA_DontShowOnScreen` + `grab()`
+离屏取证。
+
+发现并修复：
+
+| 问题 | 处理 |
+| --- | --- |
+| 空格子引导文字被图标网格（单元格仅 76px）挤成 3~4 行竖排，观感破相（既有问题） | 新增 `FileWidget._apply_guide_layout()`：空状态切 `ListMode` + `wordWrap` + 非等高条目，文字占满整行；**不动 `gridSize/iconSize`**，缩放档位记忆与既有断言不受影响 |
+| 空↔非空切换、缩放/预览切换时布局可能错乱 | 新增 `_is_empty` 状态位（refresh 时更新）与 `_guide_active`；仅在"由空转非空"时恢复预览布局，避免每次刷新重设样式表 |
+| 面板未勾选框（`GlassCheckBox` 未选中态描边/填充 45/14）在深底上几乎不可见 | 对比度提高到 78/24（悬停 110/40） |
+| 搜索格子空提示同样被网格挤窄 | `SearchWidget._run_search()` 空提示走引导布局；有结果时恢复预览方式布局 |
+
+实机结论：玻璃效果（圆角、双层描边、壁纸透出、标题栏与渐隐分隔线）成立；
+全部窗口矩形在屏内（8 个格子默认 270×360 逻辑、面板底边未越界）；
+`panelGeometry` 恢复与越界钳制正常。
+
+### 只读文件导致的副本堆积（真机反馈修复）
+
+真机复现：桌面在 C:、收纳库在 D:，跨盘移动 = 复制 + 删源；Windows 下源为只读
+时"删源"抛 `PermissionError` → **目标已生成副本、源仍留在原地**。旧实现只标记
+"失败"就继续，副本永远留在收纳库，用户每点一次「一键整理桌面」就多叠一份同名
+副本（实测 `jifang` 12 份、只读 exe 9 份，累计约 10.7 GB），且这些文件始终收纳
+不进格子。
+
+| 改动 | 要点 |
+| --- | --- |
+| `organizer.move_entry`（新增） | 统一移动入口，顺序"先正常试、失败才修"：① 直接 `shutil.move`（快路径，不额外扫描/改属性）；② 失败先清掉本次生成的半成品目标（防副本堆积）；③ 源含只读位则解除只读重试一次；④ 成功后把副本还原为只读，重试仍失败则还原源属性并计入失败 |
+| `organizer.organize_desktop` / `undo_moves` / `move_into` | 全部改走 `move_entry`，覆盖一键整理、拖入、剪切粘贴与撤销（撤销只读条目同样不再留副本） |
+| `organizer._iter_candidates` / 预览 / 整理 | 新增 `enabled_categories`：只收纳"当前显示为格子"的分类，未启用分类（如未勾选「视频」）留在桌面并在状态栏提示，避免"搬进无格子目录后凭空消失" |
+| `control_panel._do_organize` / `main._auto_organize` | 传入 `set(config["categories"])`，并把 `skipped` 的结果提示出来（不再静默） |
+
+数据清理（经用户确认）：按"同目录同基名"判定重复，保留每组无编号原件，删除 43 项
+编号副本、回收约 **11.1 GB**；同时把「整理时收走文件夹」改为关闭，桌面三个含只读
+文件的大文件夹（`jifang` / `markdown` / `fish.jokerx.top`）留在桌面。
+
+### 格子操作体验与同名文件夹合并（真机反馈）
+
+真机反馈三点：① 桌面上与收纳库里各有一个 `jifang`，为什么两份；② 格子里的条目
+希望按 Delete 能直接删掉；③ 从格子里拖出去后，格子里应该就没有了。
+
+| 改动 | 要点 |
+| --- | --- |
+| `widgets.FileListWidget.keyPressEvent`（新增） | Delete 键把选中条目交给 `delete_cb`；格子默认接到右键同款"删除到回收站"入口（仍有确认框，可在资源管理器恢复）。空状态提示条目没有真实路径，不参与删除 |
+| `widgets.DRAG_ACTION` / `FileListWidget.startDrag` | 拖出只声明 `MoveAction`。资源管理器对跨盘（D: 收纳库 → C: 桌面）拖放默认按"复制"处理，源文件会留在收纳库里——格子上"拖出来了却没少"、桌面却多一份副本；现在跨盘拖出也真正移走源文件，`drag_finished_cb` 随后刷新列表 |
+| `organizer.merge_directory`（新增） / `organize_desktop` | 目标已有同名文件夹时改为逐项合并，不再生成 `jifang (2)`：同名且内容一致（大小一致 + 修改时间差 ≤ 2 秒，沿用 robocopy 口径）视为重复，桌面那份送回收站（回收站不可用则退化为改名保留，绝不静默丢数据）；同名但内容不同用 `unique_path` 改名，两份都留；子目录递归合并；有条目搬不动时保留现场并按"整理失败"上报。合并产生的逐项移动各自记入 MoveRecord，撤销可逐条还原 |
+
+桌面那份残缺 `jifang`（19 个子目录全空、37 个顶层文件在收纳库中均有且尺寸/时间
+完全一致、无任何独有文件）已送回收站；收纳库里完整的（1564 个文件）保留。
+
+### 测试
+- 由 100 → **127**。新增用例见 CHANGELOG 2.7.2。
+- 回归命令：`$env:QT_QPA_PLATFORM="offscreen"; python -m pytest tests/ -q`。
+- UI 改动后复跑：**109 passed**；并用 `tools/make_readme_screenshots.py`
+  重生成 `docs/images/{hero,menu,compact}.png`（该脚本桩上下文补了缺失的
+  `search_service` 属性）。
+- 实机验证修复（空状态引导布局 + 勾选框对比度）后复跑：**109 passed**。
+- 只读文件跨盘移动修复后复跑：**117 passed**（新增 `tests/test_organizer_readonly.py`
+  8 例，覆盖只读源重试成功、重试失败不留半成品、重复整理不叠副本、
+  未启用分类留在桌面、预览尊重启用分类、撤销/拖入只读源不留副本）。
+- 格子 Delete 键 / 拖出即移走 / 同名文件夹合并去重复跑：**127 passed**
+  （新增 `tests/test_organizer_merge.py` 6 例与 `test_widgets_smoke.py` 4 例）。
+
+### 未改动
+- 业务逻辑、界面**布局与交互**保持不变；`_auto_confirm_timer` 与
+  `_auto_retry_timer` 共用 `_confirm_and_collect` 的双定时器结构保留
+  （回调幂等，风险低，避免为小概率问题改动核心状态机）。
+- 手动整理 / 拖拽 / 撤销 / 路径映射的路径与键名均未变动。
+- 未新增任何轮询定时器（性能红线）。
+
+## 23. v2.8.0 快捷启动与 exe 打包（2026-10-14）
+
+用户需求：做一个方便的快捷启动本工具的方式。确认方案为「桌面 + 开始菜单快捷
+方式」与「打包成独立 exe」两项。
+
+### 新增文件
+
+| 文件 | 职责 |
+| --- | --- |
+| `shortcut.py`（新增，纯逻辑层） | `create_launch_shortcuts()` 在桌面与开始菜单各生成一份快捷方式；`launch_target()` 处理双形态启动目标；`build_ps_command()` 构造 PowerShell 脚本 |
+| `tools/make_app_icon.py` | 生成 `assets/app_icon.ico`（16/32/48/64/128/256 六个尺寸） |
+| `tools/build_exe.py` | PyInstaller 打包（`--onefile --windowed --collect-data pypinyin --exclude-module tkinter --icon`），产物 `dist/桌面分类助手.exe`（实测 45.5 MB） |
+| `control_panel.py` | 新增「快捷启动」行 + `_create_shortcuts()`；`main.AppContext.create_shortcuts()` 转发到 shortcut |
+
+实现选择：用系统 PowerShell 的 `WScript.Shell` COM 写 `.lnk`，而不是引入 pywin32
+——`requirements.txt` 不变，源码运行与 exe 两种形态都能调用。
+
+为什么自己拼 ICO：Qt 的 ICO 写入在本机会直接把进程打崩（0xC0000409），
+而 PyInstaller 的 `--icon` 与快捷方式的 `IconLocation` 都只认 .ico；
+于是把若干尺寸的 PNG 按 ICO 容器格式手工打包（Vista+ 支持 PNG 条目）。
+
+### 打包适配（易踩的坑）
+
+| 改动 | 要点 |
+| --- | --- |
+| `config.app_dir()`（新增） | 打包后返回 **exe 所在目录**。onefile 模式下 `__file__` 是临时解包目录（退出即删），拿它当默认收纳库根目录会让用户资料随目录一起消失 |
+| `main.SCRIPT_PATH` | 打包后取空串；`autostart.build_autostart_command(exe, "")` 只写 exe 自身，避免注册表自启项指向开机时已不存在的临时脚本 |
+| `shortcut.launch_target()` | 同样双形态：源码运行用 `pythonw.exe "…\main.py"`（无控制台黑窗），打包后直接指向 exe |
+
+### 真机验证（本机执行）
+
+- 桌面与开始菜单两份 `.lnk` 均已生成并回读校验：`TargetPath=pythonw.exe`、
+  `WorkingDirectory=D:\小设计`、`IconLocation=…\assets\app_icon.ico,0`；
+  桌面那份 `Hotkey=Alt+Ctrl+D`，开始菜单那份为空（组合键只挂第一份——
+  两份 .lnk 抢同一个热键时系统只认其中一个）。
+- **踩坑**：`CreateShortcut` 读的是**已存在的 .lnk**，不赋值就保留旧值
+  （重写开始菜单那份时旧热键一直残留）。修复：图标/热键即使为空也显式赋空值。
+- `dist\桌面分类助手.exe` 启动冒烟：进程正常退出（exit 0，检测到已有实例后
+  转交"唤起面板"请求），说明 PySide6 等依赖已正确打包。
+- 配置沿用 `%APPDATA%\MyDeskOrganizer\settings.json`（`storageRoot=D:\小设计\收纳库`），
+  exe 与源码运行共用同一收纳库，不会分裂成两份数据。
+
+### 测试
+- 139 passed（新增 `tests/test_shortcut.py` 9 例、`test_config.py` 2 例、
+  `test_autostart.py` 1 例）。
+- 回归命令：`$env:QT_QPA_PLATFORM="offscreen"; python -m pytest tests/ -q`。
+
+## 24. v2.8.1 交互精简与图片缩略图（2026-10-14）
+
+用户需求三项：排查"桌面还有东西没进格子"、精简右键菜单、图片可在格子里预览。
+
+### 排查结论：桌面条目未过滤进格子（仅分析，按用户选择不改公共桌面）
+
+按用户"分析一下别急着动手"，逐条定位如下（用户选择"暂不处理公共桌面"）：
+
+1. **只扫用户桌面**：`get_desktop_path()` 读注册表得 `C:\Users\35954\Desktop`
+   （当时仅剩 desktop.ini），**公共桌面** `C:\Users\Public\Desktop` 的 13 个
+   系统快捷方式永不纳入扫描 —— 这正是用户"看到桌面上还有东西"的直接原因。
+2. **自动整理未开**：`autoOrganize: false`，一键整理之外不会自动收纳。
+3. **基线机制**：开启监听/重启/退出游戏模式时把当时桌面全量设入 `_auto_seen`，
+   于是"开启前就存在的条目"永远不在自动整理范围（只能靠一键整理）。
+4. **分类未勾选**：当时 categories 缺"视频/音频"，其文件按设计留在桌面并提示。
+5. 次要：写入中临时名（.crdownload/.part/~$）、隐藏点文件、同名 15 分钟保护。
+
+### 右键菜单精简（去掉「尺寸调整」与「锁定位置」）
+
+- 菜单分区由「条目操作 / 粘贴 / 外观与尺寸 / 格子管理 / 刷新」变为
+  「条目操作 / 粘贴 / 外观 / 格子管理 / 刷新」：移除「尺寸调整」子菜单与
+  「锁定位置」复选项。
+- 连带清理位置锁定的全部实现：`FileWidget` 的 `locked`/`_set_locked`、
+  `_show_zoom_menu`、`_reset_scale`、`_reset_window_size`；`main.handle_lock_changed`
+  与重命名/删除格子里的 `lockedWidgets` 维护；`config.DEFAULT_CONFIG` 的
+  `lockedWidgets` 键。窗口尺寸改由**拖拽边缘**、图标大小改由 **Ctrl+滚轮** 调整。
+
+### 图片内容缩略图（后台解码）
+
+- 新增 `ThumbnailService`（QObject 单例，`ready = Signal(str,int,QImage)`）：
+  `get()` 命中 `(路径,mtime,边长)` 缓存即回 QImage，否则提交 `ThumbnailTask`
+  （QRunnable）到 `QThreadPool`（2 线程）后台解码，完成后 `_store()` 写缓存并 emit。
+- 解码只产出 **QImage**（QPixmap/QIcon 只能在 GUI 线程建）；`QImageReader`
+  设 `setScaledSize` + `setAutoTransform`（省解码量、尊重 EXIF 方向）。
+- `FileWidget.refresh()` 逐条 `_set_item_icon()`：图片走缩略图（未就绪先放系统
+  图标占位，`_on_thumb_ready` 回填），非图片走系统图标；紧凑列表 IconSize 24。
+
+### 关键坑：信号连接方式会导致进程崩溃
+
+- **现象**：`ready.connect(self._on_thumb_ready)` 后，测试进程随机
+  `Fatal Python error: Aborted`（栈溢出式 GC 崩溃），崩溃点还会漂移。
+- **根因**：PySide6 连接绑定方法时，全局服务**强引用**每个格子，窗口
+  `close()` 后仍无法释放，垃圾回收期触发 Qt 崩溃。
+- **修复**：改为经 `weakref` 转发（`_dispatch_thumb`），并在 `closeEvent`
+  断开连接 —— 既不钉住窗口，也不让服务无限累积失效回调。
+
+### 拖拽缩放修复与"去霓虹"视觉收敛
+
+- **拖边缘吸附只改被拖边**：旧实现拖下缘时把 `top = edge_y - height`、拖右缘时把
+  `left = edge_x - width`，于是拖下边会带动上边（用户反馈"我拉下面为什么上面也动"）。
+  现改为拖下缘只改 `height`、拖右缘只改 `width`，对边钉住，吸附后再做最小尺寸钳制。
+- **保留玻璃、去掉霓虹**：`COLOR_ACCENT` 由 `#4cc2ff` 改为钢灰 `#93a1b3`；背景由
+  偏蓝 `(30,34,44)` 改中性炭灰 `(31,31,35)`；顶部高光 30→16；圆角 16→12；选中态、
+  对齐线、菜单、面板强调按钮全部去蓝。
+
+### 测试
+- 143 passed（缩略图准入/解码边界/缓存命中 3 例；缩略图+菜单断言更新；拖边缘吸附
+  回归 1 例，验证下缘/右缘吸附时对边保持不动）。
+- 回归命令：`$env:QT_QPA_PLATFORM="offscreen"; python -m pytest tests/ -q`。
+
+## 25. v2.9.0 条目重命名 / 内置分类改名 / 搜索条扁平化（2026-10-14）
+
+用户需求两项：**重命名功能必须实现**（文件条目 + 格子名两者都要）、搜索格子改为
+**扁扁的只有搜索框大小**的形态。经 AskUserQuestion 确认：搜索格子"改成扁平搜索条"。
+
+### 关键设计：分类键（grid_key）与显示名（title）分离
+
+内置分类的**分类键必须保持稳定**——`classify()` 按扩展名只会返回
+`文档/图片/…/其他` 这些固定名，自动整理据此定位目标文件夹；`enabled_categories`
+（`set(config["categories"])`）也按下拉固定键匹配。若把「文档」的键改成别的名字，
+自动整理会找不到格子而**停止收纳文档**，控制面板还会出现重复勾选框。
+
+因此内置分类改名**只改显示名**，键 / 文件夹 / 记忆 / 历史全部不动：
+
+- 新增配置 `gridTitles = {分类键: 显示名}`（`config.DEFAULT_CONFIG`）。
+- `FileWidget` 新增 `grid_key` 参数：`title` 是用户可见的显示名（可改名），
+  `grid_key` 是配置键（位置 / 尺寸 / 缩放 / 预览记忆与删除操作用它）。
+  `main.rebuild_widgets` 构造格子时 `display = titles.get(name, name)`，
+  并传 `grid_key=name`；所有持久化读写（`handle_position_changed` /
+  `save_all_positions` / `handle_zoom_changed` / `handle_size_changed` /
+  `handle_preview_changed`）统一改用 `grid_key`。
+- `main.rename_grid`：`old_name in BUILTIN_GRID_NAMES` → 只 `titles[old_name] = new_name`，
+  其余分支（自定义 / 映射格子）沿用原逻辑（改键、改文件夹、迁移记忆与历史）。
+- 重名判断改按**显示名**比较（键可能与显示名不同）；`SEARCH_GRID_TITLE`（"搜索"）
+  是保留名，create/rename 的校验名单均追加它，避免占用后误命中搜索条判断。
+
+### 条目重命名（文件 / 文件夹）
+
+- 纯逻辑层 `organizer.rename_entry` / `validate_entry_name`（不依赖 PySide6）：
+  校验非法字符（与资源管理器一致 `\ / : * ? " < > |`）、空名、句点结尾、
+  `.`/`..` 保留名；目标已存在**绝不覆盖**（抛 `ValueError`）；源缺失抛
+  `FileNotFoundError`；被占用 / 无权限抛 `OSError`。改名只动目录项，**只读文件
+  也能成功**（不写文件内容）。
+- UI 层：`FileListWidget` 右键菜单新增「重命名（F2）」（多项置灰），
+  `keyPressEvent` 拦截 F2；`FileWidget._rename_paths` 走 `QInputDialog` 取名，
+  成功后 `refresh()` 重建列表。
+- **校验顺序**：一开始先查源文件存在再校验名称，导致"非法名称 + 不存在的源"
+  抛 `FileNotFoundError` 而非 `ValueError`；改为**先校验用户输入**（边界优先），
+  并把 `.`/`..` 判在句点规则之前（否则 `..` 被误判为"以句点结尾"）。
+
+### 搜索格子 → 扁平搜索条（SearchWidget）
+
+- **静态形态**：`300×46`，只有"一个搜索框"的高度；隐藏标题栏 / 计数 / 打开按钮，
+  输入框插入布局中；不画标题分隔线（`_bar_mode`），不允许拖边缘改尺寸
+  （`_resizable=False`）。
+- **动态展开**：`_apply_bar_height()` 按结果行数算高度——无结果收起只剩输入框，
+  有结果向下展开（最多 `SEARCH_RESULT_MAX_ROWS=9` 行，再多滚动）；结果回来前
+  先收起。`_run_search` 空关键词直接 `_set_result_rows(0)`。
+- **固定单列**：`set_preview` 重写为恒 `super().set_preview(False)`，
+  结果一行一条、行尾带分类标签 `名称（分类）`，行高可预测便于算展开高度；
+  「预览方式」对搜索条无效（菜单里也不再出现该项）。
+- 只保留**拖动与位置记忆**（键名固定为 `SEARCH_GRID_TITLE`）。
+
+### 截图工具修复：幽灵方块
+
+`tools/make_readme_screenshots.py` 的 `draw_widget` 用 `grab()` 位图的
+**设备像素宽高**画阴影矩形，而 `drawPixmap` 按**逻辑尺寸**绘制；位图带
+`devicePixelRatio=2`，于是每个格子都拖出一个 2 倍大的黑色"幽灵盒子"。
+改为 `width/ratio`、`height/ratio` 换算回逻辑尺寸后，截图恢复干净。
+
+### 测试
+- 154 passed（较 v2.8.1 的 143 增 11 例）：`rename_entry` 文件/文件夹改名、
+  目标已存在不覆盖、源缺失、6 组非法名称 + 1 组合法名称、只读文件可改名；
+  内置分类改名只改显示名（`categories`/文件夹不变、`grid_key` 稳定）；
+  搜索条空关键词收起（`list_widget.isHidden()`）、有结果变高、固定单列；
+  右键菜单含「重命名（F2）」、内置分类「重命名格子」由禁用改为可用。
+- 回归命令：`$env:QT_QPA_PLATFORM="offscreen"; python -m pytest tests/ -q`。

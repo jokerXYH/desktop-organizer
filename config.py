@@ -7,10 +7,11 @@
 import copy
 import json
 import os
+import sys
 from typing import Any, Dict, List
 
 # 应用版本号（语义化版本：主版本.次版本.修订号；与 README / CHANGELOG 同步更新）
-APP_VERSION = "2.7.1"
+APP_VERSION = "2.9.0"
 
 # 配置目录与文件路径常量
 CONFIG_DIR = os.path.join(
@@ -24,9 +25,21 @@ HISTORY_MAX_RECORDS = 2000
 # 文件夹分类名（与 organizer.FOLDER_CATEGORY 一致，避免 GUI 模块依赖）
 FOLDER_CATEGORY = "文件夹"
 
+
+def app_dir() -> str:
+    """程序所在目录：打包成 exe 后为 exe 所在目录，否则为源码根目录。
+
+    为什么不能直接用 __file__：PyInstaller onefile 模式下 __file__ 指向临时
+    解包目录（退出即删）。若拿它当默认收纳库根目录，用户整理的资料会连目录
+    一起消失；同理自启项也会指向一个不存在的脚本。
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 # 默认收纳根目录：程序目录下的"收纳库"（可跨机器使用；面板中可随时修改）
-_DEFAULT_STORAGE_ROOT = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "收纳库")
+_DEFAULT_STORAGE_ROOT = os.path.join(app_dir(), "收纳库")
 
 # 默认配置
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -41,10 +54,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "widgetScales": {},                            # 图标/列宽缩放：{分类名: 缩放比}
     "widgetPreviews": {},                          # 单格子预览方式：{分类名: True=图标视图}
     "gridPaths": {},                               # 路径映射格子：{分类名: 映射的文件夹}
+    "gridTitles": {},                              # 显示名记忆：{分类键: 显示名}
+                                                   # 内置分类改名只改这里，分类键不变
     "autoOrganize": False,                         # 自动整理新出现的桌面文件
     "autoOrganizeDelay": 300,                      # 自动整理前的静置等待（秒）
     "searchGrid": True,                            # 桌面搜索格子（常驻，可删除）
-    "lockedWidgets": [],                           # 锁定了位置的格子（分类名列表）
     "confirmOrganize": True,                       # 一键整理前先预览确认
     "panelGeometry": "",                           # 控制面板位置记忆："x,y,w,h"
     "categories": ["文档", "图片", "视频", "音频", "压缩包", "安装包",

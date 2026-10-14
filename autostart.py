@@ -13,12 +13,12 @@ RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 VALUE_NAME = "MyDeskOrganizer"
 
 
-def build_autostart_command(exe_path: str, script_path: str) -> str:
+def build_autostart_command(exe_path: str, script_path: str = "") -> str:
     """构造自启命令行字符串（纯函数，便于测试）。
 
-    :param exe_path: Python 解释器路径
-    :param script_path: 入口脚本绝对路径
-    :return: 如 '"C:\\Python\\pythonw.exe" "D:\\Tools\\main.py"'
+    :param exe_path: Python 解释器路径；打包成 exe 后传 exe 自身路径
+    :param script_path: 入口脚本绝对路径；打包成 exe 后为空（exe 自己就是入口）
+    :return: 如 '"C:\\Python\\pythonw.exe" "D:\\Tools\\main.py"'，或 '"D:\\App\\桌面分类助手.exe"'
     """
     exe = exe_path
     # 自启需要无窗口运行：若当前是 python.exe 且同目录存在 pythonw.exe 则替换
@@ -26,6 +26,8 @@ def build_autostart_command(exe_path: str, script_path: str) -> str:
         pythonw = os.path.splitext(exe_path)[0] + "w.exe"
         if os.path.exists(pythonw):
             exe = pythonw
+    if not script_path:
+        return f'"{exe}"'          # 打包模式：exe 本身即入口，不带脚本参数
     return f'"{exe}" "{script_path}"'
 
 

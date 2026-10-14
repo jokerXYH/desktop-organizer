@@ -67,6 +67,8 @@ class _StubContext:
                            storageRoot=r"D:\DesktopOrganizer\收纳库",
                            categories=["文档", "图片", "压缩包", "音频",
                                        "文件夹", "其他"])
+        # 面板构造时会读取该属性并决定是否连接搜索信号；截图用桩置空即可
+        self.search_service = None
 
     def map_folder_interactive(self):
         pass
@@ -129,11 +131,17 @@ def make_background(width, height):
 
 
 def draw_widget(painter, widget_pixmap, x, y):
-    """把控件画到画布上（带柔和投影）。"""
+    """把控件画到画布上（带柔和投影）。
+
+    grab() 得到的位图带 devicePixelRatio=2：drawPixmap 按**逻辑尺寸**绘制，
+    所以阴影矩形也必须换算回逻辑尺寸，否则会画出 2 倍大的"幽灵盒子"。
+    """
+    ratio = widget_pixmap.devicePixelRatio() or 1.0
+    width = widget_pixmap.width() / ratio
+    height = widget_pixmap.height() / ratio
     painter.setPen(Qt.NoPen)
     painter.setBrush(QColor(0, 0, 0, 90))
-    painter.drawRoundedRect(x + 8, y + 12, widget_pixmap.width(),
-                            widget_pixmap.height(), 16, 16)
+    painter.drawRoundedRect(x + 8, y + 12, width, height, 16, 16)
     painter.drawPixmap(x, y, widget_pixmap)
 
 
@@ -194,7 +202,7 @@ def main():
     painter.setPen(QColor("#e8eaed"))
     painter.setFont(QFont("Microsoft YaHei UI", 15, QFont.DemiBold))
     painter.drawText(130, 240,
-                     "右键菜单：打开 / 复制路径 / 剪切粘贴 / 尺寸调整 / 新建·映射·删除格子")
+                     "右键菜单：打开 / 复制路径 / 剪切粘贴 / 预览方式 / 新建·映射·删除格子")
     painter.end()
     canvas.save(os.path.join(out_dir, "menu.png"))
 
