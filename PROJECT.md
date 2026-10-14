@@ -511,3 +511,51 @@ python -m pytest tests/ -q    # 期望 80 passed
 - PySide6 现为 6.12.0（重建 v2.6 时记录的是 6.10.3，升级不影响行为）。
 
 ### 新增测试（合计 94）
+
+## 21. v2.7.1 自动整理时序修复（2026-10-14，实测复现修复）
+
+### 现象（用户实测 v2.7.0）
+- 收纳库\文件夹 出现 fish.jokerx.top / jifang / markdown 各 7 份、
+  安装包 YIQI K3.exe 3 份、文档某答案 PDF 8 份——同一释放源反复释放，
+  自动整理反复收集。
+- 部分 PDF 留在桌面未被收纳（"遗漏分类"）。
+
+### 根因
+1. `_run_auto_organize` 静置到期**立即 shutil.move**：撞上还在写入的条目，
+   搬走后释放方按路径重建 → 同名条目反复再现 → 反复收集成副本。
+2. `organize_desktop` 对移动失败（被占用）静默 continue，`_run_auto_organize`
+   随后把该名称写进 `_auto_seen` 基线 → **永远不再重试**（遗漏的来源）。
+3. 浏览器下载临时名（.crdownload）被当"其他"收走，改名后产生第二份。
+
+### 修复后的状态机（AppContext）
+- `_auto_stable: {名称: 快照}`——待确认条目；快照=文件(大小, mtime) /
+  文件夹(子条目数, mtime)。`_auto_rounds` 连续观察轮数（上限 45 轮放弃）。
+- `_run_auto_organize`（静置到期）：
+  过滤 IN_PROGRESS 临时名 → 同名重复保护（`_auto_collected` 15 分钟窗口，
+  命中则跳过+提示+入基线）→ 剩余条目快照进 `_auto_stable` → 启动
+  `_auto_confirm_timer(2000ms)`。基线=当前桌面\待确认\临时名。
+- `_confirm_and_collect`（确认/重试到期，共用回调）：
+  逐条比对快照——变化者刷新快照继续观察；消失者移出；稳定者调
+  `organize_desktop(only_names, skip_in_progress=True, return_failed=True)`。
+  成功 → 记 `_auto_collected` 时间戳（供同名保护）；失败 → `_auto_attempts`
+  计数 +1，重试定时器 30s，达到 `AUTO_MAX_ATTEMPTS=5` 放弃（入基线+提示）。
+- 游戏模式：进入时停 `_auto_confirm_timer/_auto_retry_timer`（待确认保留）；
+  退出时如有待确认则重启确认。`_sync_auto_watcher` 重建基线时
+  `-= set(self._auto_stable)`，不会吞掉待确认条目。
+
+### organizer.py 接口变化
+- 新增 `IN_PROGRESS_SUFFIXES/PREFIXES` 与 `is_in_progress_name()`。
+- `_iter_candidates(..., skip_in_progress=False)`；`organize_desktop(...,
+  skip_in_progress=False, return_failed=False)`——return_failed=True 返回
+  `(records, failed_names)`；默认 False 完全兼容旧调用与旧测试。
+
+### 维护提醒
+- 桌面上有程序在反复释放 jifang / markdown / fish.jokerx.top 等条目
+  （实测各 7 份副本），需要定位该释放源（疑似网盘同步/课程资料工具）；
+  15 分钟同名保护只能止损，不能替代释放源治理。
+- 深层缺口：文件夹内部深层文件的持续写入（顶层条目数与目录 mtime 不变）
+  不会被稳定性快照发现，仍依赖同名保护兜底。
+
+### 新增测试（合计 99）
+- test_auto_organize_waits_for_stability / skips_in_progress_names /
+  locked_file_retries / gives_up_after_max_attempts / duplicate_guard。

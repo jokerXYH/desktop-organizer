@@ -34,6 +34,20 @@ CATEGORY_RULES: Dict[str, set] = {
 # 整理时默认忽略的文件（避免搬走系统关键文件）
 IGNORED_NAMES = {"desktop.ini", "dumpstack.log.tmp", "swapfile.sys"}
 
+# "还在写入中"的临时名（自动整理跳过；手动整理不受影响）：
+# 浏览器下载中 .crdownload/.part、Office 打开文档时的 ~$ 锁文件等。
+# 直接收走这类文件会撞上写入方随后按路径重建/改名，制造副本与遗漏。
+IN_PROGRESS_SUFFIXES = (".crdownload", ".part", ".partial", ".download")
+IN_PROGRESS_PREFIXES = ("~$",)
+
+
+def is_in_progress_name(name: str) -> bool:
+    """判断是否"还在写入中"的临时文件名（浏览器下载中 / Office 锁文件等）。"""
+    low = name.lower()
+    if low.endswith(IN_PROGRESS_SUFFIXES):
+        return True
+    return name.startswith(IN_PROGRESS_PREFIXES)
+
 
 @dataclass
 class MoveRecord:
@@ -107,11 +121,13 @@ def unique_path(path: str) -> str:
 
 def _iter_candidates(desktop_path: str, storage_root: str,
                      include_shortcuts: bool, include_folders: bool,
-                     only_names=None):
+                     only_names=None, skip_in_progress: bool = False):
     """枚举桌面上应被整理的条目（供整理与预览共用）。
 
     逐个 yield (名称, 完整路径, 分类)；桌面不可访问时抛 RuntimeError。
     only_names 不为 None 时仅处理名称在该集合中的条目（自动整理用）。
+    skip_in_progress 为 True 时跳过"还在写入中"的临时名（自动整理用，
+    手动整理/预览保持所见即所得，不受影响）。
     """
     try:
         entries = os.listdir(desktop_path)
@@ -119,6 +135,8 @@ def _iter_candidates(desktop_path: str, storage_root: str,
         raise RuntimeError(f"无法访问桌面目录: {exc}") from exc
     for name in entries:
         if only_names is not None and name not in only_names:
+            continue
+        if skip_in_progress and is_in_progress_name(name):
             continue
         src = os.path.join(desktop_path, name)
         # 跳过隐藏文件、系统文件，以及收纳库自身/内部路径（自我保护）
@@ -142,7 +160,8 @@ def _iter_candidates(desktop_path: str, storage_root: str,
 def organize_desktop(desktop_path: str, storage_root: str,
                      include_shortcuts: bool = False,
                      include_folders: bool = True,
-                     only_names=None) -> List[MoveRecord]:
+                     only_names=None, skip_in_progress: bool = False,
+                     return_failed: bool = False):
     """一键整理：把桌面顶层文件/文件夹按分类移动到收纳根目录的对应子文件夹。
 
     :param desktop_path: 桌面目录
@@ -150,24 +169,31 @@ def organize_desktop(desktop_path: str, storage_root: str,
     :param include_shortcuts: 是否把快捷方式也收走（默认留在桌面）
     :param include_folders: 是否把桌面顶层文件夹整体收进"文件夹"分类
     :param only_names: 仅整理名称集合中的条目（自动整理新文件用），None=全部
-    :return: 本次成功移动的 MoveRecord 列表（同一 batch）
+    :param skip_in_progress: 跳过"还在写入中"的临时名（自动整理用）
+    :param return_failed: 为 True 时返回 (成功记录, 失败名称列表)，
+        供自动整理做有界重试（默认 False 保持旧返回值，兼容手动整理与测试）
+    :return: 本次成功移动的 MoveRecord 列表（同一 batch）；return_failed 时为元组
     """
     batch = uuid.uuid4().hex[:12]
     records: List[MoveRecord] = []
+    failed_names: List[str] = []
     for name, src, category in _iter_candidates(
             desktop_path, storage_root, include_shortcuts, include_folders,
-            only_names):
+            only_names, skip_in_progress):
         dest_dir = os.path.join(storage_root, category)
         os.makedirs(dest_dir, exist_ok=True)
         dst = unique_path(os.path.join(dest_dir, name))
         try:
             shutil.move(src, dst)
         except (OSError, shutil.Error):
-            continue  # 单个文件失败（被占用等）不影响其余文件
+            failed_names.append(name)  # 单个文件失败（被占用等）不影响其余文件
+            continue
         records.append(MoveRecord(
             src=src, dst=dst, batch=batch,
             time=datetime.now().isoformat(timespec="seconds"),
         ))
+    if return_failed:
+        return records, failed_names
     return records
 
 

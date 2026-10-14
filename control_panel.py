@@ -237,15 +237,21 @@ class ControlPanel(QWidget):
                 self.ctx.refresh_status("已取消整理")
                 return
         try:
-            records = org.organize_desktop(
+            records, failed = org.organize_desktop(
                 desktop, root,
                 include_shortcuts=include_shortcuts,
-                include_folders=include_folders)
+                include_folders=include_folders, return_failed=True)
         except RuntimeError as exc:
             QMessageBox.critical(self, "整理失败", str(exc))
             return
         cfg.append_records([r.to_dict() for r in records])
         self.ctx.on_organize(len(records))
+        if failed:                          # 失败（被占用等）不再静默，明确告知
+            names = "、".join(failed[:3])
+            suffix = f" 等 {len(failed)} 项" if len(failed) > 3 else ""
+            self.ctx.refresh_status(
+                f"已整理 {len(records)} 项，{len(failed)} 项失败"
+                f"（{names}{suffix}，可能被占用）")
 
     def _confirm_preview(self, preview) -> bool:
         """把整理预览结果整理成"分类：n 项"摘要，请用户确认后再执行。"""

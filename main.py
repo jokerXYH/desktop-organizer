@@ -10,6 +10,7 @@ import ctypes
 import os
 import shutil
 import sys
+import time
 import uuid
 from ctypes import wintypes
 from datetime import datetime
@@ -40,6 +41,14 @@ SCRIPT_PATH = os.path.abspath(__file__)
 
 # 文件系统事件到达后的防抖刷新间隔（毫秒），合并突发改动避免频繁刷列表
 REFRESH_DEBOUNCE_MS = 400
+
+# 自动整理的稳定性确认与失败重试（v2.7.1：修复"收走还在写入的文件"与
+# "移动失败后被基线吞掉、永久遗漏"两类问题）
+AUTO_CONFIRM_MS = 2000         # 静置到期后还需稳定不变的确认窗口（毫秒）
+AUTO_MAX_CONFIRM_ROUNDS = 45   # 条目持续变化的观察轮数上限（约 90 秒后放弃）
+AUTO_RETRY_MS = 30000          # 移动失败（被占用）后的重试间隔（毫秒）
+AUTO_MAX_ATTEMPTS = 5          # 同一条目的最大自动重试次数
+AUTO_DUP_GUARD_S = 900         # 同名条目重复出现的保护窗口（秒，15 分钟）
 
 # 单实例互斥：本地套接字服务名（Windows 上对应命名管道）
 SINGLE_INSTANCE_KEY = "MyDeskOrganizer.SingleInstance"
@@ -149,6 +158,17 @@ class AppContext:
         self._auto_timer.setSingleShot(True)
         self._auto_timer.timeout.connect(self._run_auto_organize)
         self._auto_seen: set = set()   # 开启自动整理时的桌面基线（只整理之后新出现的）
+        # 稳定性确认与重试状态（v2.7.1 两段式自动整理）
+        self._auto_stable: dict = {}   # 待确认条目 {名称: (文件大小或目录条目数, mtime)}
+        self._auto_rounds: dict = {}   # 条目的连续确认轮数（防"永远在变化"死循环）
+        self._auto_attempts: dict = {}  # 移动失败条目的已尝试次数 {名称: 次数}
+        self._auto_collected: dict = {}  # 近期已自动收纳的条目 {名称: 时间戳}（同名重复保护）
+        self._auto_confirm_timer = QTimer()
+        self._auto_confirm_timer.setSingleShot(True)
+        self._auto_confirm_timer.timeout.connect(self._confirm_and_collect)
+        self._auto_retry_timer = QTimer()
+        self._auto_retry_timer.setSingleShot(True)
+        self._auto_retry_timer.timeout.connect(self._confirm_and_collect)
         self._guide_overlay = None     # 拖动对齐指示线覆盖层（懒加载）
 
     # ---------- 格子管理 ----------
@@ -659,6 +679,8 @@ class AppContext:
             self._refresh_timer.stop()                            # 停止待执行的刷新
             self.watcher.removePaths(self.watcher.directories())  # 暂停监听
             self._auto_timer.stop()                               # 自动整理同样暂停
+            self._auto_confirm_timer.stop()   # 待确认条目保留在内存，退出后继续
+            self._auto_retry_timer.stop()
             if notify and self.tray is not None:
                 self.tray.showMessage(
                     "游戏模式已开启",
@@ -667,6 +689,8 @@ class AppContext:
         else:
             self._sync_watcher_paths()
             self.refresh_all()
+            if self._auto_stable:             # 有待确认条目：恢复稳定性确认
+                self._auto_confirm_timer.start(AUTO_CONFIRM_MS)
         self._sync_auto_watcher()
         self.panel.set_game_mode_checked(enabled)
         if self.act_game_mode is not None:
@@ -714,11 +738,18 @@ class AppContext:
         cfg.save_config(self.config)
         if enabled:
             self._auto_seen = set(self._list_desktop())   # 以当前桌面为基线
+            self._auto_stable.clear()
+            self._auto_rounds.clear()
+            self._auto_attempts.clear()
             self._sync_auto_watcher()
             delay = int(self.config.get("autoOrganizeDelay", 300))
             self.refresh_status(f"自动整理已开启（新文件静置 {delay} 秒后收纳）")
         else:
             self._auto_timer.stop()
+            self._auto_confirm_timer.stop()
+            self._auto_retry_timer.stop()
+            self._auto_stable.clear()
+            self._auto_rounds.clear()
             self._sync_auto_watcher()
             self.refresh_status("自动整理已关闭")
         self.panel.set_auto_organize_checked(enabled)     # 面板与托盘同步，不触发回调
@@ -748,6 +779,7 @@ class AppContext:
             if desktop not in current:
                 self._auto_watcher.addPaths([desktop])
                 self._auto_seen = set(self._list_desktop())  # 开始监听时以当前桌面为基线
+                self._auto_seen -= set(self._auto_stable)    # 待确认条目仍算"新"，不吞掉
         elif current:
             self._auto_watcher.removePaths(current)
 
@@ -758,25 +790,153 @@ class AppContext:
         delay = max(5, int(self.config.get("autoOrganizeDelay", 300)))
         self._auto_timer.start(delay * 1000)
 
+    def _stat_entry(self, name: str):
+        """取桌面条目的稳定性快照；文件=(大小, mtime)，文件夹=(条目数, mtime)。
+
+        文件夹用"直接子条目数 + 目录 mtime"：解压/拷贝程序每落一个文件，
+        这两个值都会变，足以识别"还在写入中"。条目不存在返回 None。
+        """
+        try:
+            path = os.path.join(org.get_desktop_path(), name)
+            stat = os.stat(path)
+            if os.path.isdir(path):
+                return (len(os.listdir(path)), int(stat.st_mtime))
+            return (stat.st_size, int(stat.st_mtime))
+        except OSError:
+            return None
+
     def _run_auto_organize(self):
-        """静置计时结束：把开启自动整理之后新出现的桌面条目收纳归位。"""
+        """静置计时结束：新条目先进入稳定性确认，不再立即搬运。
+
+        旧实现在此直接 shutil.move，撞上"还在写入/解压"的条目时：搬走后
+        写入方按路径重建目录继续写 → 桌面反复重现同名文件夹 → 收纳库堆出
+        "(2)(3)"副本；而移动失败（被占用）的条目又被基线吞掉，永远不会再
+        重试（表现为"PDF 遗漏分类"）。因此改为两段式：
+        静置到期 → 快照 → 确认窗口内无变化才真正收纳（见 _confirm_and_collect）。
+        """
         if self._game_mode or not self.config.get("autoOrganize", False):
             return
         current = set(self._list_desktop())
         new_names = current - self._auto_seen
-        self._auto_seen = current
-        if not new_names:
+        pending = set(self._auto_stable) | new_names
+
+        # 还在写入中的临时名（浏览器 .crdownload 等）：不收也不进基线，
+        # 等写入方改成最终文件名后自然会作为新条目正常收纳
+        pending = {n for n in pending if not org.is_in_progress_name(n)}
+
+        # 同名重复保护：刚收纳过的名字短时间再现，多半是某个程序在反复释放
+        # （v2.6 曾出现同一文件夹被反复收录出 14 份副本）；跳过并提示手动处理
+        now = time.time()
+        for name in [n for n, t in self._auto_collected.items()
+                     if now - t >= AUTO_DUP_GUARD_S]:
+            self._auto_collected.pop(name, None)        # 顺带清理过期记录
+        guarded = {n for n in pending
+                   if now - self._auto_collected.get(n, 0) < AUTO_DUP_GUARD_S}
+        if guarded:
+            pending -= guarded
+            names = "、".join(sorted(guarded)[:3])
+            suffix = f" 等 {len(guarded)} 项" if len(guarded) > 3 else ""
+            self.refresh_status(
+                f"「{names}」{suffix}在 {AUTO_DUP_GUARD_S // 60} 分钟内重复出现在桌面，"
+                "已跳过自动收纳（可能是某个程序在反复释放，请手动处理）")
+
+        # 基线更新：当前桌面上既不在待确认、也不是写入中临时名的都算"旧"
+        in_progress_now = {n for n in current if org.is_in_progress_name(n)}
+        self._auto_seen |= (current - pending - in_progress_now)
+
+        # 进入稳定性确认窗口
+        snaps = {name: self._stat_entry(name) for name in pending}
+        self._auto_stable = {n: s for n, s in snaps.items() if s is not None}
+        if self._auto_stable:
+            self._auto_confirm_timer.start(AUTO_CONFIRM_MS)
+
+    def _confirm_and_collect(self):
+        """稳定性确认到期（或失败重试到期）：只收纳确认窗口内未变化的条目。
+
+        仍在变化的条目刷新快照继续观察（观察轮数有上限，防"永远在变化"）；
+        移动失败（被占用）的条目进入有界重试：最多 AUTO_MAX_ATTEMPTS 次，
+        超过则基线化并提示手动整理，不再无限循环。
+        """
+        if self._game_mode or not self.config.get("autoOrganize", False):
             return
-        records = org.organize_desktop(
+        if not self._auto_stable:
+            return
+        stable, churning = [], []
+        for name, snap in list(self._auto_stable.items()):
+            current = self._stat_entry(name)
+            if current is None:
+                self._auto_stable.pop(name, None)   # 消失了（改名/手动处理）
+                self._auto_rounds.pop(name, None)
+            elif current == snap:
+                stable.append(name)
+            else:
+                churning.append(name)               # 还在变化，继续观察
+
+        for name in churning:
+            rounds = self._auto_rounds.get(name, 0) + 1
+            if rounds >= AUTO_MAX_CONFIRM_ROUNDS:
+                self._auto_stable.pop(name, None)   # 观察上限已到：放弃该条目
+                self._auto_rounds.pop(name, None)
+                self._auto_seen.add(name)
+                self.refresh_status(
+                    f"「{name}」持续变化超过 {AUTO_MAX_CONFIRM_ROUNDS} 轮观察，"
+                    "已跳过自动收纳，请手动处理")
+            else:
+                self._auto_rounds[name] = rounds
+                self._auto_stable[name] = self._stat_entry(name)
+        if churning and self._auto_stable:
+            self._auto_confirm_timer.start(AUTO_CONFIRM_MS)  # 继续下一轮观察
+
+        if not stable:
+            self._auto_seen |= set(self._list_desktop()) - set(self._auto_stable)
+            return
+
+        records, failed = org.organize_desktop(
             org.get_desktop_path(), self.config["storageRoot"],
             include_shortcuts=bool(self.config.get("includeShortcuts", False)),
             include_folders=bool(self.config.get("includeFolders", True)),
-            only_names=new_names)
+            only_names=set(stable), skip_in_progress=True, return_failed=True)
+
+        now = time.time()
+        for name in set(stable) - set(failed):
+            self._auto_stable.pop(name, None)
+            self._auto_rounds.pop(name, None)
+            self._auto_attempts.pop(name, None)
+            self._auto_collected[name] = now       # 记录时间戳，供同名重复保护
+
+        if failed:
+            retry, give_up = [], []
+            for name in failed:
+                attempts = self._auto_attempts.get(name, 0) + 1
+                if attempts >= AUTO_MAX_ATTEMPTS:
+                    give_up.append(name)
+                    self._auto_attempts.pop(name, None)
+                    self._auto_stable.pop(name, None)   # 移出待确认，停止重试
+                    self._auto_rounds.pop(name, None)
+                    self._auto_seen.add(name)      # 放弃重试：入基线，不再打扰
+                else:
+                    self._auto_attempts[name] = attempts
+                    fresh = self._stat_entry(name)
+                    if fresh is not None:
+                        self._auto_stable[name] = fresh
+                        retry.append(name)
+                    else:
+                        self._auto_seen.add(name)  # 重试间隙里消失了
+            if retry:
+                self._auto_retry_timer.start(AUTO_RETRY_MS)
+            if give_up:
+                names = "、".join(give_up[:3])
+                suffix = f" 等 {len(give_up)} 项" if len(give_up) > 3 else ""
+                self.refresh_status(
+                    f"自动整理已放弃 {len(give_up)} 项（{names}{suffix}，"
+                    "多次移动失败可能被占用），请手动整理")
+
         if records:
             cfg.append_records([r.to_dict() for r in records])
             self.refresh_all()
             self.refresh_status(f"自动整理：已收纳 {len(records)} 个新文件/文件夹")
-            self._auto_seen = set(self._list_desktop())
+        # 基线 = 当前桌面 \ 待确认（待确认与待重试的仍是"新"，等待下一轮）
+        self._auto_seen |= set(self._list_desktop()) - set(self._auto_stable)
 
     # ---------- 业务回调（供控制面板调用） ----------
 

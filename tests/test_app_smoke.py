@@ -224,7 +224,8 @@ def test_auto_organize_new_files_only(ctx, tmp_path, monkeypatch):
     ctx.set_auto_organize(True)                  # 基线=当前桌面（旧文件不整理）
     (desktop / "新文件.pdf").write_text("new", encoding="utf-8")
 
-    ctx._run_auto_organize()
+    ctx._run_auto_organize()                     # 静置到期：进入稳定性确认
+    ctx._confirm_and_collect()                   # 确认无变化：真正收纳
 
     root = ctx.config["storageRoot"]
     assert os.path.exists(os.path.join(root, "文档", "新文件.pdf"))
@@ -233,6 +234,145 @@ def test_auto_organize_new_files_only(ctx, tmp_path, monkeypatch):
 
     ctx.set_auto_organize(False)
     assert ctx._auto_watcher.directories() == []
+
+
+# ---------- v2.7.1 自动整理时序修复回归 ----------
+
+def test_auto_organize_waits_for_stability(ctx, tmp_path, monkeypatch):
+    """还在写入的文件不被搬走：确认窗口内大小变化 → 继续等；稳定后只收一次。"""
+    desktop = tmp_path / "fake_desktop"
+    desktop.mkdir()
+    monkeypatch.setattr(org, "get_desktop_path", lambda: str(desktop))
+    ctx.set_auto_organize(True)
+    target = desktop / "下载中.pdf"
+    target.write_text("部分内容", encoding="utf-8")
+
+    ctx._run_auto_organize()                     # 进入稳定性确认
+    target.write_text("部分内容，还在继续写入更长的内容", encoding="utf-8")
+    ctx._confirm_and_collect()                   # 确认窗口内变化 → 不收
+
+    root = ctx.config["storageRoot"]
+    assert not os.path.exists(os.path.join(root, "文档", "下载中.pdf"))
+    assert target.exists()
+    assert len(cfg.load_history()) == 0
+
+    ctx._run_auto_organize()                     # 第二轮：已稳定
+    ctx._confirm_and_collect()
+    assert os.path.exists(os.path.join(root, "文档", "下载中.pdf"))
+    assert not target.exists()
+    assert len(cfg.load_history()) == 1
+
+
+def test_auto_organize_skips_in_progress_names(ctx, tmp_path, monkeypatch):
+    """下载中的临时名（.crdownload）不收也不进基线；改成最终名后正常归档。"""
+    desktop = tmp_path / "fake_desktop"
+    desktop.mkdir()
+    monkeypatch.setattr(org, "get_desktop_path", lambda: str(desktop))
+    ctx.set_auto_organize(True)
+
+    part = desktop / "报告.pdf.crdownload"
+    part.write_text("half", encoding="utf-8")
+    ctx._run_auto_organize()
+    ctx._confirm_and_collect()
+
+    root = ctx.config["storageRoot"]
+    assert part.exists()                          # 临时名原样留在桌面
+    assert os.listdir(os.path.join(root, "其他")) == []   # 没被误收进"其他"
+    assert "报告.pdf.crdownload" not in ctx._auto_seen    # 不进基线
+
+    os.replace(part, desktop / "报告.pdf")        # 模拟浏览器下载完成改名
+    ctx._run_auto_organize()
+    ctx._confirm_and_collect()
+
+    assert os.path.exists(os.path.join(root, "文档", "报告.pdf"))
+    assert len(cfg.load_history()) == 1
+
+
+def test_auto_organize_locked_file_retries(ctx, tmp_path, monkeypatch):
+    """被占用的文件不被基线吞掉：失败进入有界重试，占用释放后自动补收。"""
+    desktop = tmp_path / "fake_desktop"
+    desktop.mkdir()
+    monkeypatch.setattr(org, "get_desktop_path", lambda: str(desktop))
+    ctx.set_auto_organize(True)
+    locked = desktop / "锁定.pdf"
+    locked.write_text("x", encoding="utf-8")
+
+    real_move = org.shutil.move
+    failing = {"now": True}
+
+    def flaky_move(src, dst):
+        if failing["now"] and os.path.basename(src) == "锁定.pdf":
+            raise PermissionError("文件被占用")
+        return real_move(src, dst)
+
+    monkeypatch.setattr(org.shutil, "move", flaky_move)
+
+    ctx._run_auto_organize()
+    ctx._confirm_and_collect()                   # 第一次尝试：被占用
+    assert locked.exists()
+    assert ctx._auto_attempts.get("锁定.pdf") == 1
+    assert "锁定.pdf" in ctx._auto_stable         # 留在待确认队列等重试
+    assert ctx._auto_retry_timer.isActive()
+
+    failing["now"] = False                       # 模拟占用释放
+    ctx._confirm_and_collect()                   # 重试到期（与确认共用回调）
+    root = ctx.config["storageRoot"]
+    assert os.path.exists(os.path.join(root, "文档", "锁定.pdf"))
+    assert ctx._auto_attempts == {}
+    assert len(cfg.load_history()) == 1
+
+
+def test_auto_organize_gives_up_after_max_attempts(ctx, tmp_path, monkeypatch):
+    """持续被占用的条目重试 AUTO_MAX_ATTEMPTS 次后放弃并提示，不无限循环。"""
+    desktop = tmp_path / "fake_desktop"
+    desktop.mkdir()
+    monkeypatch.setattr(org, "get_desktop_path", lambda: str(desktop))
+    ctx.set_auto_organize(True)
+    locked = desktop / "钉子户.pdf"
+    locked.write_text("x", encoding="utf-8")
+
+    def always_fail(src, dst):
+        raise PermissionError("文件被占用")
+
+    monkeypatch.setattr(org.shutil, "move", always_fail)
+    from main import AUTO_MAX_ATTEMPTS
+
+    ctx._run_auto_organize()
+    for _ in range(AUTO_MAX_ATTEMPTS):
+        ctx._confirm_and_collect()
+
+    assert locked.exists()                        # 始终留在桌面，从不丢失
+    assert ctx._auto_attempts == {}               # 计数已清理
+    assert "钉子户.pdf" not in ctx._auto_stable   # 不再待确认
+    assert "钉子户.pdf" in ctx._auto_seen         # 入基线：不再反复打扰
+    assert len(cfg.load_history()) == 0
+    assert "放弃" in ctx.panel.status_label.text()
+
+
+def test_auto_organize_duplicate_guard(ctx, tmp_path, monkeypatch):
+    """刚收纳过的同名条目短时间再现（程序反复释放）不重复入库。"""
+    desktop = tmp_path / "fake_desktop"
+    desktop.mkdir()
+    monkeypatch.setattr(org, "get_desktop_path", lambda: str(desktop))
+    ctx.set_auto_organize(True)
+
+    folder = desktop / "资料"
+    folder.mkdir()
+    (folder / "a.txt").write_text("a", encoding="utf-8")
+    ctx._run_auto_organize()
+    ctx._confirm_and_collect()
+    root = ctx.config["storageRoot"]
+    assert os.path.exists(os.path.join(root, "文件夹", "资料", "a.txt"))
+
+    folder.mkdir()                                # 模拟释放方重建同名文件夹
+    (folder / "b.txt").write_text("b", encoding="utf-8")
+    ctx._run_auto_organize()
+    ctx._confirm_and_collect()
+
+    assert (folder / "b.txt").exists()            # 新副本留在桌面，不重复入库
+    assert not os.path.exists(os.path.join(root, "文件夹", "资料", "b.txt"))
+    assert "资料" in ctx._auto_seen               # 入基线：不再反复提示
+    assert "重复" in ctx.panel.status_label.text()
 
 
 def test_search_grid(ctx):
