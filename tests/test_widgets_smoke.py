@@ -561,6 +561,7 @@ def test_context_menu_has_tidy_and_collapse(tmp_path):
     texts = [act.text() for act in widget._build_menu(QPoint(-1, -1)).actions()]
     assert any("整齐排列" in text for text in texts)
     assert any("收起" in text for text in texts)
+    assert any("一键整理桌面" in text for text in texts)
 
     widget.set_collapsed(True)
     texts = [act.text() for act in widget._build_menu(QPoint(-1, -1)).actions()]

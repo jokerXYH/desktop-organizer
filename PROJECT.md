@@ -6,7 +6,7 @@
 ## 1. 项目是什么
 
 Windows 桌面文件整理工具（Python + PySide6，独立自研）：
-当前版本 v2.9.1，版本历史见仓库根的 CHANGELOG.md。
+当前版本 v2.9.2，版本历史见仓库根的 CHANGELOG.md。
 - 桌面右侧悬浮一排**分类格子窗口**（无边框、半透明、置底、不抢任务栏）
 - 一键整理：把桌面顶层文件/文件夹按扩展名分类移入收纳库
 - 拖拽：把任意文件/文件夹拖进格子即移入对应分类文件夹
@@ -903,3 +903,43 @@ python -m pytest tests/ -q    # 期望 143 passed
 ### 测试
 - 154 → **172**：`tests/test_layout.py`（新增 10 例，纯函数）+ widgets/app 冒烟 8 例。
 - 回归：`$env:QT_QPA_PLATFORM="offscreen"; python -m pytest tests/ -q` → **172 passed**。
+
+## 27. v2.9.2 桌面右键「一键整理」与关于页（2026-10-14）
+
+用户需求：把一键整理做到桌面右键菜单；控制面板补充「详情介绍 / 更新 / 免责声明」。
+
+### 桌面右键菜单（`shell_menu.py` 新增，HKCU 注册表）
+- 位置：`HKCU\Software\Classes\DesktopBackground\Shell\MyDeskOrganizer`
+  （MUIVerb + Icon + command 子键）——不需要管理员权限，不是 COM shell 扩展，
+  删除即卸载，行为透明。
+- 命令：与自启同一套规则（复用 `autostart.build_autostart_command` 再追加
+  ` --organize`）：源码 = `"pythonw.exe" "main.py" --organize`；
+  打包 = `"exe" --organize`。
+- 流程：点击后 `main()` 用 `cli_action` 解析出 organize → 单实例通道发送
+  `b"organize"` → 常驻实例 `_on_new_connection` 读取消息 → `ctx.organize_now()`
+  （show_panel + 面板同一 `_do_organize`：尊重预览确认、写历史、可撤销）。
+  未运行时正常启动程序，启动完成后 `QTimer.singleShot(120, ctx.organize_now)`。
+- 自愈：`refresh_if_stale` —— 注册的命令指向的文件不存在（目录搬迁/换形态）时，
+  下次启动自动改写为当前路径；命令仍有效则不动。
+- 系统适配：Win10 直接进桌面右键一级菜单；Win11 位于「显示更多选项」二级
+  （`platform_menu_hint()` 给出说明，用作面板开关 tooltip）；非 Windows 提示不可用。
+- 面板开关「桌面右键菜单（一键整理）」：勾选=register、取消=unregister，
+  OSError 回滚 + 弹窗（同自启开关模式）；实际状态以注册表为准。
+
+### 应用内入口
+- 托盘菜单「一键整理桌面」；格子/搜索条右键「一键整理桌面」；
+  与面板按钮共用 `AppContext.organize_now()`。
+
+### 关于页（控制面板）
+- `AboutDialog` + `build_about_html` / `latest_changelog_sections`（纯函数可测）：
+  详情介绍（功能/快捷键/收纳库与配置位置/隐私）、更新日志（程序目录
+  CHANGELOG.md 最近 6 个版本，缺失时降级）、免责声明（撤销/回收站、备份提醒、
+  按"原样"提供、隐私）；附「打开收纳库 / 打开配置目录」按钮；无任何网络请求。
+  `APP_QSS` 增补 QTextBrowser 暗色规则。
+
+### 测试
+- 172 → **188**：`test_shell_menu.py` 8 例、`test_about.py` 5 例、app 冒烟 3 例；
+  app 夹具 patch `shell_menu.is_registered`（所有测试不碰真实注册表）。
+- 回归：`$env:QT_QPA_PLATFORM="offscreen"; python -m pytest tests/ -q` → **188 passed**。
+- 真机：注册菜单项（reg query 复核）→ 重启程序（加载新代码）→ 桌面右键可见
+  「一键整理桌面（桌面分类助手）」。

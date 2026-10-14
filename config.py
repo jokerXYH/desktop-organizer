@@ -11,7 +11,7 @@ import sys
 from typing import Any, Dict, List
 
 # 应用版本号（语义化版本：主版本.次版本.修订号；与 README / CHANGELOG 同步更新）
-APP_VERSION = "2.9.1"
+APP_VERSION = "2.9.2"
 
 # 配置目录与文件路径常量
 CONFIG_DIR = os.path.join(
@@ -47,6 +47,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "includeShortcuts": False,                     # 一键整理是否收走快捷方式
     "includeFolders": True,                        # 一键整理是否收走桌面文件夹
     "autostart": False,                            # 开机自启（注册表 Run 键）
+    "shellMenu": False,                            # 桌面右键菜单记录值；实际以注册表为准
     "previewIcons": True,                          # 格子预览：True=图标视图 False=紧凑列表
     "gameMode": False,                             # 游戏模式：隐藏格子并暂停监听
     "widgetPositions": {},                         # 格子位置记忆：{分类名: "x,y"}

@@ -87,7 +87,8 @@ def test_defaults_contain_v2_keys():
                 "gameMode", "widgetPositions", "widgetSizes",
                 "confirmOrganize", "panelGeometry", "widgetScales",
                 "widgetPreviews", "gridPaths", "autoOrganize",
-                "autoOrganizeDelay", "searchGrid", "widgetCollapsed"):
+                "autoOrganizeDelay", "searchGrid", "widgetCollapsed",
+                "shellMenu"):
         assert key in cfg.DEFAULT_CONFIG
     assert cfg.FOLDER_CATEGORY in cfg.DEFAULT_CONFIG["categories"]
 

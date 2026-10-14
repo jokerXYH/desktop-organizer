@@ -767,7 +767,8 @@ class FileWidget(QWidget):
                  on_cut_files=None, on_paste_files=None,
                  clipboard_count=None, guide_show=None, guide_hide=None,
                  collapsed: bool = False, on_collapse_changed=None,
-                 on_tidy_layout=None, grid_key=None, parent=None):
+                 on_tidy_layout=None, on_organize_desktop=None,
+                 grid_key=None, parent=None):
         """初始化格子。
 
         :param title: 格子标题（显示名，可被用户重命名）
@@ -795,6 +796,7 @@ class FileWidget(QWidget):
         :param collapsed: 是否以收起形态启动（恢复上次的收起状态）
         :param on_collapse_changed: 收起/展开回调，签名 (FileWidget, bool)
         :param on_tidy_layout: 右键「整齐排列全部格子」回调（AppContext 统一整理）
+        :param on_organize_desktop: 右键「一键整理桌面」回调（复用面板同一流程）
         """
         super().__init__(parent)
         self.title = title             # 显示名（用户可见，可重命名）
@@ -818,6 +820,7 @@ class FileWidget(QWidget):
         self.guide_hide = guide_hide
         self.on_collapse_changed = on_collapse_changed
         self.on_tidy_layout = on_tidy_layout
+        self.on_organize_desktop = on_organize_desktop
         self._collapsed = False        # 收起状态：只剩标题栏高度
         self._expanded_height = None   # 收起前的高度（展开时还原）
         self.scale = 1.0               # 图标/列宽缩放比（1.0 = 基准 38px 图标）
@@ -1550,6 +1553,9 @@ class FileWidget(QWidget):
         act_delete.triggered.connect(
             lambda: self.on_delete_grid(self) if self.on_delete_grid else None)
         menu.addSeparator()
+        menu.addAction("一键整理桌面",
+                       lambda: self.on_organize_desktop()
+                       if self.on_organize_desktop else None)
         menu.addAction("刷新", self.refresh)
         return menu
 

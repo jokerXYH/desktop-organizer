@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (QApplication, QFileDialog, QInputDialog,
 import autostart
 import config as cfg
 import organizer as org
+import shell_menu
 import shortcut
 from control_panel import ControlPanel
 from search_service import SearchService
@@ -82,6 +83,8 @@ QDialog QLineEdit,QInputDialog QLineEdit{background:rgba(255,255,255,10);
       padding:6px 10px;color:#eceef1;
       selection-background-color:rgba(255,255,255,70);}
 QDialog QLineEdit:focus{border-color:rgba(255,255,255,150);}
+QTextBrowser{background:rgba(0,0,0,70);border:1px solid rgba(255,255,255,26);
+      border-radius:10px;padding:8px;color:#eceef1;}
 """
 
 
@@ -112,16 +115,25 @@ class GlobalHotkeyFilter(QAbstractNativeEventFilter):
         return False, 0
 
 
-def notify_running_instance() -> bool:
-    """检测是否已有实例在运行；有则请求它显示控制面板并返回 True。"""
+def notify_running_instance(message: bytes = b"show") -> bool:
+    """检测是否已有实例在运行；有则发送请求并返回 True。
+
+    消息含义：b"show" = 显示控制面板（默认）；b"organize" = 执行一键整理
+    （桌面右键菜单进入时使用，见 cli_action）。
+    """
     socket = QLocalSocket()
     socket.connectToServer(SINGLE_INSTANCE_KEY)
     if not socket.waitForConnected(300):
         return False
-    socket.write(b"show")
+    socket.write(message)
     socket.waitForBytesWritten(300)
     socket.disconnectFromServer()
     return True
+
+
+def cli_action(argv) -> str:
+    """从命令行参数解析本次启动意图："organize"（一键整理）或 "show"（默认唤起面板）。"""
+    return "organize" if "--organize" in list(argv) else "show"
 
 
 def make_tray_icon() -> QIcon:
@@ -269,6 +281,7 @@ class AppContext:
                 collapsed=bool(collapsed_map.get(name, False)),
                 on_collapse_changed=self.handle_collapse_changed,
                 on_tidy_layout=self.tidy_layout,
+                on_organize_desktop=self.organize_now,
                 grid_key=name)
             saved = cfg.parse_position(positions.get(name, ""))
             if saved and self._position_visible(saved[0], saved[1],
@@ -311,7 +324,8 @@ class AppContext:
                 on_zoom_changed=self.handle_zoom_changed,
                 guide_show=self.show_guides,
                 guide_hide=self.hide_guides,
-                on_tidy_layout=self.tidy_layout)
+                on_tidy_layout=self.tidy_layout,
+                on_organize_desktop=self.organize_now)
             saved = cfg.parse_position(positions.get(name, ""))
             if saved and self._position_visible(saved[0], saved[1],
                                                 search_widget.width(),
@@ -763,6 +777,17 @@ class AppContext:
         self.config["autostart"] = enabled
         cfg.save_config(self.config)
 
+    def set_shell_menu(self, enabled: bool):
+        """添加/移除桌面右键菜单项（HKCU 注册表；失败抛 OSError 由面板提示）。"""
+        if enabled:
+            shell_menu.register(SCRIPT_PATH)
+        else:
+            shell_menu.unregister()
+        self.config["shellMenu"] = bool(enabled)
+        cfg.save_config(self.config)
+        self.refresh_status("已添加桌面右键菜单：一键整理桌面"
+                            if enabled else "已移除桌面右键菜单")
+
     # ---------- 快捷启动 ----------
 
     def create_shortcuts(self) -> list:
@@ -1177,6 +1202,16 @@ class AppContext:
         self.panel.raise_()
         self.panel.activateWindow()
 
+    def organize_now(self):
+        """一键整理桌面（桌面右键菜单 / 托盘 / 格子右键共用面板同一流程）。
+
+        先显示控制面板（预览确认弹窗以面板为父窗口，保证可见与居中）；
+        整理流程本身完全复用 control_panel._do_organize：
+        尊重「整理前先预览确认」开关、写历史、可撤销。
+        """
+        self.show_panel()
+        QTimer.singleShot(60, self.panel._do_organize)
+
 
 def main():
     """程序入口：初始化 Qt 应用、注册热键、构建托盘与格子。"""
@@ -1185,8 +1220,11 @@ def main():
     app.setApplicationName("桌面分类助手")
     app.setStyleSheet(APP_QSS)
 
-    # 单实例：已有实例在运行时，唤起它的控制面板后本进程直接退出
-    if notify_running_instance():
+    # 单实例：已有实例在运行时，把本次意图转交后本进程直接退出
+    # （b"organize" 来自桌面右键菜单「一键整理桌面」；默认是唤起控制面板）
+    action = cli_action(sys.argv)
+    if notify_running_instance(
+            b"organize" if action == "organize" else b"show"):
         return
 
     ctx = AppContext()
@@ -1198,12 +1236,46 @@ def main():
 
     def _on_new_connection():
         conn = server.nextPendingConnection()
-        if conn is not None:
-            conn.readyRead.connect(conn.readAll)
-            conn.disconnected.connect(conn.deleteLater)
-        ctx.activate()
+        if conn is None:
+            return
+        state = {"handled": False}
+
+        def _dispatch(data: bytes):
+            state["handled"] = True
+            if b"organize" in data:
+                ctx.organize_now()     # 桌面右键菜单：一键整理桌面
+            else:
+                ctx.activate()         # 常规唤起：显示控制面板
+
+        def _deliver(*_args):
+            if state["handled"]:
+                return
+            data = bytes(conn.readAll())
+            if data:
+                _dispatch(data)
+
+        def _fallback():
+            # 数据迟迟未到（异常客户端/系统抖动）：按"唤起面板"兜底，确保一定有响应
+            if state["handled"]:
+                return
+            try:
+                data = bytes(conn.readAll())
+            except RuntimeError:           # 连接对象已销毁
+                data = b""
+            _dispatch(data)
+
+        conn.readyRead.connect(_deliver)
+        conn.disconnected.connect(_deliver)    # 断开兜底：缓冲区可能仍有数据
+        conn.disconnected.connect(conn.deleteLater)
+        QTimer.singleShot(300, _fallback)
 
     server.newConnection.connect(_on_new_connection)
+
+    # 桌面右键菜单已注册但指向的程序不存在（换过目录/形态）：自动改写到当前路径
+    try:
+        shell_menu.refresh_if_stale(SCRIPT_PATH)
+    except OSError:
+        pass
 
     # 注册全局热键：F7 显隐格子 / F8 控制面板 / F9 游戏模式（失败时托盘提示）
     hotkey_filter = None
@@ -1227,6 +1299,8 @@ def main():
     menu = QMenu()
     act_panel = QAction("控制面板 (F8)", menu)
     act_panel.triggered.connect(ctx.show_panel)
+    act_organize = QAction("一键整理桌面", menu)
+    act_organize.triggered.connect(ctx.organize_now)
     act_toggle = QAction("显示/隐藏格子 (F7)", menu)
     act_toggle.triggered.connect(ctx.toggle_widgets)
     act_tidy = QAction("整齐排列格子", menu)
@@ -1240,7 +1314,7 @@ def main():
         lambda checked: ctx.set_auto_organize(checked))
     act_quit = QAction("退出", menu)
     act_quit.triggered.connect(app.quit)
-    for act in (act_panel, act_toggle, act_tidy, act_game, act_auto):
+    for act in (act_panel, act_organize, act_toggle, act_tidy, act_game, act_auto):
         menu.addAction(act)
     menu.addSeparator()
     menu.addAction(act_quit)
@@ -1269,6 +1343,8 @@ def main():
         ctx.show_panel()
     if ctx.config.get("autoOrganize", False) and not ctx._game_mode:
         ctx.set_auto_organize(True)             # 恢复自动整理（重新建立桌面基线）
+    if action == "organize":                    # 桌面右键菜单启动：进入后即执行整理
+        QTimer.singleShot(120, ctx.organize_now)
 
     app.aboutToQuit.connect(ctx.save_all_positions)
     exit_code = app.exec()

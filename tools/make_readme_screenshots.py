@@ -28,6 +28,7 @@ from PySide6.QtWidgets import QApplication
 import autostart
 import config as cfg
 import organizer as org
+import shell_menu
 from control_panel import ControlPanel
 from widgets import FileWidget, SearchWidget
 
@@ -148,6 +149,7 @@ def draw_widget(painter, widget_pixmap, x, y):
 def main():
     storage = build_demo_storage()
     autostart.get_autostart_enabled = lambda: False   # 截图固定为未勾选
+    shell_menu.is_registered = lambda: False          # 截图固定为未注册
     app = QApplication(sys.argv)
     out_dir = os.path.join(ROOT, "docs", "images")
     os.makedirs(out_dir, exist_ok=True)

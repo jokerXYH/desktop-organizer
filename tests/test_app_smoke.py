@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 import config as cfg  # noqa: E402
 import organizer as org  # noqa: E402
+import shell_menu  # noqa: E402
 from main import AppContext  # noqa: E402
 from widgets import COLLAPSED_HEIGHT, WIDGET_GAP  # noqa: E402
 
@@ -25,6 +26,8 @@ def ctx(tmp_path, monkeypatch):
     monkeypatch.setattr(cfg, "HISTORY_PATH", str(tmp_path / "history.json"))
     cfg.save_config(dict(cfg.DEFAULT_CONFIG,
                          storageRoot=str(tmp_path / "收纳库")))
+    # 面板构造会读取桌面右键菜单的注册状态：测试固定为未注册（不碰真实注册表）
+    monkeypatch.setattr(shell_menu, "is_registered", lambda: False)
     context = AppContext()
     context.rebuild_widgets()
     yield context
@@ -952,3 +955,47 @@ def test_rebuild_positions_are_stable(ctx):
     after = {w.grid_key: (w.x(), w.y(), w.width(), w.height())
              for w in ctx.widgets}
     assert before == after
+
+
+# ---------- v2.9.2 桌面右键菜单与关于页 ----------
+
+def test_panel_has_shell_menu_and_about(ctx):
+    """面板包含「桌面右键菜单」开关与「关于」按钮。"""
+    assert "桌面右键菜单" in ctx.panel.shell_menu_check.text()
+    assert "关于" in ctx.panel.about_btn.text()
+
+
+def test_panel_shell_menu_toggle(ctx, monkeypatch):
+    """桌面右键菜单开关：开→注册、关→移除、记录写入配置。"""
+    calls = []
+    monkeypatch.setattr(shell_menu, "register",
+                        lambda script: calls.append("register"))
+    monkeypatch.setattr(shell_menu, "unregister",
+                        lambda: calls.append("unregister"))
+
+    ctx.panel.shell_menu_check.setChecked(True)
+    assert calls[-1] == "register"
+    assert cfg.load_config()["shellMenu"] is True
+
+    ctx.panel.shell_menu_check.setChecked(False)
+    assert calls[-1] == "unregister"
+    assert cfg.load_config()["shellMenu"] is False
+
+
+def test_shell_menu_toggle_rolls_back_on_error(ctx, monkeypatch):
+    """注册表写入失败：勾选回滚 + 弹窗提示，不抛异常。"""
+    from PySide6.QtWidgets import QMessageBox
+
+    def boom(_script):
+        raise OSError("注册表被拒绝")
+
+    monkeypatch.setattr(shell_menu, "register", boom)
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox, "warning",
+        staticmethod(lambda *args, **kwargs: warnings.append(args)))
+
+    ctx.panel.shell_menu_check.setChecked(True)
+
+    assert not ctx.panel.shell_menu_check.isChecked()   # 勾选回滚
+    assert warnings                                     # 有弹窗提示

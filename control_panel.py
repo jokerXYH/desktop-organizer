@@ -5,19 +5,21 @@
 保证逻辑层可独立测试。
 v2：新增开机自启、游戏模式、预览方式切换、收纳库搜索与暗色美化。
 """
+import html
 import os
 
 from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,
-                               QFileDialog, QGridLayout, QHBoxLayout,
-                               QLabel, QLineEdit, QListWidget,
+                               QDialog, QFileDialog, QGridLayout,
+                               QHBoxLayout, QLabel, QLineEdit, QListWidget,
                                QListWidgetItem, QMessageBox, QPushButton,
-                               QVBoxLayout, QWidget)
+                               QTextBrowser, QVBoxLayout, QWidget)
 
 import autostart
 import config as cfg
 import organizer as org
+import shell_menu
 from widgets import COLOR_ACCENT, COLOR_TEXT, COLOR_TEXT_DIM, open_in_shell
 
 PANEL_WIDTH = 480    # 面板宽度
@@ -111,6 +113,97 @@ class GlassCheckBox(QCheckBox):
         painter.setFont(self.font())
         painter.drawText(QRect(box + 8, 0, self.width() - box - 8, self.height()),
                          Qt.AlignLeft | Qt.AlignVCenter, self.text())
+
+
+# ---------- 关于页（详情介绍 / 更新日志 / 免责声明） ----------
+
+def latest_changelog_sections(text: str, count: int = 6) -> str:
+    """从 CHANGELOG 全文截取最近 count 个版本段落（文件按"新版本在上"维护）。"""
+    if not text.strip():
+        return ""
+    parts = text.split("\n## ")
+    sections = [part.strip() for part in parts[1:count + 1] if part.strip()]
+    if not sections:
+        return text.strip()
+    return "\n\n".join("## " + section for section in sections)
+
+
+def read_changelog_text(count: int = 6) -> str:
+    """读取程序目录下的 CHANGELOG.md 并截取最近若干版本；读取失败返回空串。"""
+    try:
+        path = os.path.join(cfg.app_dir(), "CHANGELOG.md")
+        with open(path, "r", encoding="utf-8") as handle:
+            return latest_changelog_sections(handle.read(), count)
+    except OSError:
+        return ""
+
+
+def build_about_html(changelog_text: str, storage_root: str = "") -> str:
+    """构造「关于」页 HTML：详情介绍 / 更新日志 / 免责声明（纯函数，便于测试）。"""
+    storage = html.escape(storage_root) if storage_root else "（未设置）"
+    config_dir = html.escape(str(cfg.CONFIG_DIR))
+    if changelog_text.strip():
+        log_html = f"<pre>{html.escape(changelog_text.strip())}</pre>"
+    else:
+        log_html = (
+            "<p>未找到更新日志文件（CHANGELOG.md）。<br>"
+            f"当前版本 v{html.escape(cfg.APP_VERSION)}；完整更新日志见项目目录或"
+            "发行包中的 CHANGELOG.md。</p>")
+    return f"""<html><body>
+<h2>桌面分类助手 v{html.escape(cfg.APP_VERSION)}</h2>
+<p>Windows 桌面文件整理工具 · 完全本地运行</p>
+
+<h3>详情介绍</h3>
+<ul>
+<li>桌面悬浮分类格子：把桌面文件一键归入收纳库分类（分类可自定义、可映射任意文件夹）</li>
+<li>一键整理桌面：整理前预览确认，所有移动可撤销；桌面右键 / 托盘菜单均可触发</li>
+<li>收纳库搜索（拼音全拼与首字母）、拖动收纳与取出、格子整齐排列与收起</li>
+<li>全局快捷键：F7 显示/隐藏格子、F8 控制面板、F9 游戏模式</li>
+<li>收纳库位置：{storage}</li>
+<li>配置位置：{config_dir}</li>
+<li>隐私：所有文件与配置都保存在本机；不联网、不上传、不收集任何数据</li>
+</ul>
+
+<h3>更新日志</h3>
+{log_html}
+
+<h3>免责声明</h3>
+<p>本工具会移动、重命名您的文件：所有整理操作都会记录历史并可在面板中撤销或恢复，
+删除操作均送往回收站。仍请在使用前自行备份重要数据，并确认整理结果。</p>
+<p>本软件按“原样”提供，不附带任何明示或暗示的担保；因使用本软件造成的任何数据
+丢失或损失，作者不承担责任。</p>
+<p>隐私说明：本软件完全在本地运行，不会连接网络，不会上传、收集或分享任何文件与
+使用数据。</p>
+</body></html>"""
+
+
+class AboutDialog(QDialog):
+    """「关于」对话框：详情介绍 / 更新日志 / 免责声明（纯本地展示，无网络请求）。"""
+
+    def __init__(self, parent=None, storage_root: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle(f"关于 · 桌面分类助手 v{cfg.APP_VERSION}")
+        self.resize(560, 620)
+        layout = QVBoxLayout(self)
+
+        browser = QTextBrowser(self)
+        browser.setOpenExternalLinks(False)
+        browser.setHtml(build_about_html(read_changelog_text(), storage_root))
+        layout.addWidget(browser, 1)
+
+        row = QHBoxLayout()
+        open_storage = QPushButton("打开收纳库")
+        open_storage.clicked.connect(
+            lambda: open_in_shell(storage_root) if storage_root else None)
+        open_config = QPushButton("打开配置目录")
+        open_config.clicked.connect(lambda: open_in_shell(cfg.CONFIG_DIR))
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.accept)
+        row.addWidget(open_storage)
+        row.addWidget(open_config)
+        row.addStretch()
+        row.addWidget(close_btn)
+        layout.addLayout(row)
 
 
 class ControlPanel(QWidget):
@@ -233,6 +326,12 @@ class ControlPanel(QWidget):
         self.search_grid_check.toggled.connect(
             lambda checked: self.ctx.set_search_grid(checked))
         option_grid.addWidget(self.search_grid_check, 5, 0)
+        # 桌面右键菜单（一键整理）：Windows 注册表集成，实际状态以注册表为准
+        self.shell_menu_check = GlassCheckBox("桌面右键菜单（一键整理）")
+        self.shell_menu_check.setChecked(shell_menu.is_registered())
+        self.shell_menu_check.setToolTip(shell_menu.platform_menu_hint())
+        self.shell_menu_check.toggled.connect(self._toggle_shell_menu)
+        option_grid.addWidget(self.shell_menu_check, 6, 0)
         layout.addLayout(option_grid)
 
         # ---- 第四行：分类格子开关（勾选即显示；支持自定义格子） ----
@@ -268,6 +367,14 @@ class ControlPanel(QWidget):
         locate_row.addStretch()
         locate_row.addWidget(locate_btn)
         layout.addLayout(locate_row)
+
+        # 关于：详情介绍 / 更新日志 / 免责声明（纯本地展示，无网络请求）
+        about_row = QHBoxLayout()
+        self.about_btn = QPushButton("关于（详情 / 更新日志 / 免责声明）")
+        self.about_btn.clicked.connect(self._show_about)
+        about_row.addStretch()
+        about_row.addWidget(self.about_btn)
+        layout.addLayout(about_row)
 
         # 搜索防抖：停止输入 300ms 后才提交请求
         self._search_timer = QTimer(self)
@@ -476,6 +583,20 @@ class ControlPanel(QWidget):
             self.autostart_check.setChecked(not checked)
             self.autostart_check.blockSignals(False)
             QMessageBox.warning(self, "开机自启设置失败", str(exc))
+
+    def _toggle_shell_menu(self, checked: bool):
+        """开关桌面右键菜单项；注册表操作失败时回滚勾选并提示。"""
+        try:
+            self.ctx.set_shell_menu(checked)
+        except OSError as exc:
+            self.shell_menu_check.blockSignals(True)
+            self.shell_menu_check.setChecked(not checked)
+            self.shell_menu_check.blockSignals(False)
+            QMessageBox.warning(self, "桌面右键菜单设置失败", str(exc))
+
+    def _show_about(self):
+        """打开「关于」对话框（详情介绍 / 更新日志 / 免责声明）。"""
+        AboutDialog(self, self.ctx.config.get("storageRoot", "")).exec()
 
     def _create_shortcuts(self):
         """生成桌面与开始菜单快捷方式并汇报结果（含组合键提示）。"""
