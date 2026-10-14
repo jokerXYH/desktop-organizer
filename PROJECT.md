@@ -470,3 +470,44 @@ python -m pytest tests/ -q    # 期望 80 passed
 - `test_handle_drop_writes_history_once`（3 文件一次落盘）。
 - `test_paste_failure_keeps_items_in_clipboard`（失败项回填剪切板）。
 - `test_save_root_ignores_no_change`（未改不重建；真正改动才写配置+重建）。
+
+## 20. v2.7.0 性能与界面优化（2026-10-14）
+
+### 后台搜索（新模块 search_service.py）
+- `SearchService(QObject)`：`start(keyword, limit)` 提交后台任务（QThreadPool，
+  maxThreadCount=1 串行），`results_ready(int seq, str keyword, list)` 信号回主线程；
+  `_root_provider/_dirs_provider` 用无参函数现取，改配置即生效。
+- 接收方守卫：**序号+关键词双校验**——只比序号会在"双接收方共享服务"时误判；
+  面板 `ControlPanel._on_search_results` 与 `SearchWidget._on_results` 各自维护
+  自己最近一次提交的 seq；`_search_pending` 标志防止清空后的老请求回填。
+- `run_now()` 前台同步入口供测试与降级；service 缺省可缺席（None 分支保持旧行为）。
+- AppContext.__init__ 中 **search_service 必须先于 ControlPanel 创建**
+  （面板构造即连接其信号）。
+- 实测端到端链路（offscreen 真实事件循环）：提交→线程扫描→信号排队→回填 OK。
+
+### 事件定向刷新
+- `_on_storage_changed(path)` 把 normcase 目录收入 `_pending_dirs`；
+  `_refresh_timer.timeout → _refresh_pending()`：日志按"目录→格子"映射
+  只刷新对应 widget；搜索格子只要有任何变化就整体重跑（现有关键词）。
+- `refresh_all()` 保留给全量场景：重新显示、退出游戏模式、整理/撤销回调。
+- 已知边界：root 目录事件不会直接命中任何格子目录（分类子目录才映射），
+  由"搜索格子统一重跑"兜底。
+
+### 界面
+- 面板高度 `min(760, 屏高-80)`；`_restore_geometry` 对记忆宽高同样钳制。
+- APP_QSS 增补 QDialog/QMessageBox/QInputDialog 规则（按钮/输入框暗色）。
+- 搜索结果：紧凑模式行尾"（分类）"标签；图标模式仍只显示名称。
+- 空格子 2 条引导（主提示 + "右键空白处：新建/映射/锁定格子"）。
+- `RESIZE_EDGE` 6 → 8（拖拽热区）；拖入悬浮时背景叠加 rgba(76,194,255,26)。
+- 托盘新增"自动整理新桌面文件"勾选项；`ctx.act_auto_organize` 同步面板勾选。
+
+### 其它
+- 图标缓存超限改为批量淘汰最早一半（FIFO）。
+- BUILTIN_GRID_NAMES 统一从 widgets 导入。
+- test_app_smoke 的 ctx 夹具 teardown 增加 `pool.clear() + waitForDone(1000)`，
+  消除后台线程偶发向已销毁控件发信号的崩溃。
+
+### 启动注意
+- PySide6 现为 6.12.0（重建 v2.6 时记录的是 6.10.3，升级不影响行为）。
+
+### 新增测试（合计 94）

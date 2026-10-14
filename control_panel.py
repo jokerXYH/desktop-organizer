@@ -59,7 +59,9 @@ class ControlPanel(QWidget):
         super().__init__()
         self.ctx = ctx
         self.setWindowTitle(f"桌面分类助手 v{cfg.APP_VERSION} - 控制面板")
-        self.resize(PANEL_WIDTH, PANEL_HEIGHT)
+        # 高度按屏幕可用空间钳制：1366×768 等小屏笔记本上不会被任务栏截断
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.resize(PANEL_WIDTH, min(PANEL_HEIGHT, screen.height() - 80))
         self.setStyleSheet(PANEL_QSS)
         self._restore_geometry()          # 恢复上次关闭时的面板位置与大小
 
@@ -395,6 +397,12 @@ class ControlPanel(QWidget):
         self.search_grid_check.setChecked(checked)
         self.search_grid_check.blockSignals(False)
 
+    def set_auto_organize_checked(self, checked: bool):
+        """由外部（托盘菜单）同步自动整理勾选状态，不触发回调。"""
+        self.auto_check.blockSignals(True)
+        self.auto_check.setChecked(checked)
+        self.auto_check.blockSignals(False)
+
     # ---------- 收纳库搜索 ----------
 
     def _run_search(self):
@@ -427,9 +435,8 @@ class ControlPanel(QWidget):
         if self._search_pending:
             self._search_pending = False
         for cat, path in results:
-            item = QListWidgetItem(os.path.basename(path))
+            item = QListWidgetItem(f"{os.path.basename(path)}（{cat}）")
             item.setData(Qt.UserRole, path)
-            item.setToolTip(f"[{cat}] {path}")
             self.search_list.addItem(item)
         note = "（已达上限，可细化关键词）" if len(results) >= SEARCH_RESULT_LIMIT else ""
         self.ctx.refresh_status(f"搜索到 {len(results)} 个结果{note}")
@@ -461,12 +468,18 @@ class ControlPanel(QWidget):
     # ---------- 窗口几何记忆 ----------
 
     def _restore_geometry(self):
-        """恢复上次关闭时的面板位置与大小；越界或首次运行时居中显示。"""
+        """恢复上次关闭时的面板位置与大小；越界或首次运行时居中显示。
+
+        恢复的尺寸同样按屏幕钳制（换到小屏显示器后不会超界）。
+        """
+        screen = QApplication.primaryScreen().availableGeometry()
         saved = cfg.parse_geometry(self.ctx.config.get("panelGeometry", ""))
         if saved and self.ctx._position_visible(*saved):
-            self.setGeometry(*saved)
+            width = max(320, min(int(saved[2]), screen.width() - 40))
+            height = max(400, min(int(saved[3]), screen.height() - 80))
+            self.resize(width, height)
+            self.move(saved[0], saved[1])
             return
-        screen = QApplication.primaryScreen().availableGeometry()
         self.move(screen.center() - self.rect().center())
 
     def save_geometry(self):

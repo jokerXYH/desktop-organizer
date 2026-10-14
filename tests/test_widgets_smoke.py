@@ -24,14 +24,17 @@ def _make_widget(tmp_path, title="文档", **kwargs):
 
 
 def test_empty_folder_shows_guide(tmp_path):
-    """空格子应显示"拖入"引导提示，且提示条目不可选中。"""
+    """空格子应显示"拖入"主提示与右键操作提示，且提示条目不可选中。"""
     widget = _make_widget(tmp_path)
     widget.refresh()
 
-    assert widget.list_widget.count() == 1
+    assert widget.list_widget.count() == 2
     tip = widget.list_widget.item(0)
+    hint = widget.list_widget.item(1)
     assert "拖入" in tip.text()
+    assert "右键" in hint.text()
     assert not (tip.flags() & Qt.ItemIsEnabled)
+    assert not (hint.flags() & Qt.ItemIsEnabled)
     widget.close()
 
 

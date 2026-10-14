@@ -46,7 +46,7 @@ POSITION_SAVE_DELAY_MS = 600    # 拖动停止后延迟保存位置的防抖时�
 SNAP_DISTANCE = 10              # 拖动窗口时与其它格子边缘对齐的吸附距离（像素）
 
 # 自由调整窗口尺寸（拖拽右/下边缘或右下角，内容自动重排）
-RESIZE_EDGE = 6                 # 边缘/角落拖拽热区宽度（像素）
+RESIZE_EDGE = 8                 # 边缘/角落拖拽热区宽度（像素；6px 在小格子上难点中）
 MIN_WIDGET_W, MIN_WIDGET_H = 170, 150      # 窗口最小宽高
 MAX_WIDGET_W, MAX_WIDGET_H = 1200, 1200    # 窗口最大宽高
 SIZE_SAVE_DELAY_MS = 600        # 尺寸保存防抖（与位置保存同节奏）
@@ -565,7 +565,8 @@ class FileWidget(QWidget):
         path.addRoundedRect(0, 0, self.width(), self.height(),
                             CORNER_RADIUS, CORNER_RADIUS)
         painter.fillPath(path, COLOR_BG)
-        if self._drag_active:                       # 有文件拖拽悬停：强调色高亮边框
+        if self._drag_active:                       # 有文件拖拽悬停：背景微亮 + 强调色边框
+            painter.fillPath(path, QColor(76, 194, 255, 26))
             painter.setPen(QPen(QColor(COLOR_ACCENT), 2))
         else:
             painter.setPen(QPen(COLOR_BORDER, 1))
@@ -950,12 +951,17 @@ class FileWidget(QWidget):
         total = len(dirs) + len(files)
         self._update_count_label(total)
 
-        if total == 0:                        # 空状态引导，告诉用户格子怎么用
-            tip = QListWidgetItem("拖入文件或文件夹即可收纳")
-            tip.setFlags(Qt.NoItemFlags)
-            tip.setTextAlignment(Qt.AlignCenter)
-            tip.setForeground(QBrush(QColor("#6a7080")))
-            self.list_widget.addItem(tip)
+        if total == 0:                        # 空状态引导：主提示 + 可发现性提示
+            main_tip = QListWidgetItem("拖入文件或文件夹即可收纳")
+            main_tip.setFlags(Qt.NoItemFlags)
+            main_tip.setTextAlignment(Qt.AlignCenter)
+            main_tip.setForeground(QBrush(QColor("#6a7080")))
+            self.list_widget.addItem(main_tip)
+            hint = QListWidgetItem("右键空白处：新建 / 映射 / 锁定格子")
+            hint.setFlags(Qt.NoItemFlags)
+            hint.setTextAlignment(Qt.AlignCenter)
+            hint.setForeground(QBrush(QColor("#565c6c")))
+            self.list_widget.addItem(hint)
             return
 
         entries = dirs + files
@@ -1202,7 +1208,12 @@ class SearchWidget(FileWidget):
         """把搜索结果填充到列表并更新计数。"""
         self.count_label.setText(f"{len(results)} 项")
         for category, path in results[:MAX_LIST_ITEMS]:
-            item = QListWidgetItem(os.path.basename(path))
+            if self.preview_icons:
+                # 图标视图单元格较窄，只显示名称（分类信息看 tooltip）
+                item = QListWidgetItem(os.path.basename(path))
+            else:
+                # 紧凑列表单行宽裕，行尾带分类标签方便区分同名文件
+                item = QListWidgetItem(f"{os.path.basename(path)}（{category}）")
             item.setData(Qt.UserRole, path)
             item.setToolTip(f"[{category}] {path}")
             if self.preview_icons:

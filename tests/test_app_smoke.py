@@ -27,6 +27,9 @@ def ctx(tmp_path, monkeypatch):
     context = AppContext()
     context.rebuild_widgets()
     yield context
+    # 清空后台搜索任务并等线程收尾，避免残留后台线程向已销毁控件发信号
+    context.search_service.pool.clear()
+    context.search_service.pool.waitForDone(1000)
     for widget in context.widgets:
         widget.close()
     context.panel.close()
@@ -428,3 +431,77 @@ def test_save_root_ignores_no_change(ctx, monkeypatch):
 
     assert rebuild_calls == [1]                   # 真正改动才重建
     assert cfg.load_config()["storageRoot"] == new_root
+
+
+# ---------- v2.7.0 界面优化回归 ----------
+
+def test_panel_height_clamped_to_screen(ctx):
+    """面板高度不超过屏幕可用高度-80（1366×768 等小屏不被任务栏截断）。"""
+    screen = QApplication.primaryScreen().availableGeometry()
+    assert ctx.panel.height() <= screen.height() - 80
+
+
+def test_auto_organize_tray_panel_sync(ctx):
+    """自动整理开关：ctx 状态变化同步面板勾选与托盘动作，无信号递归。"""
+    from PySide6.QtGui import QAction
+
+    ctx.act_auto_organize = QAction(None, checkable=True)
+    ctx.act_auto_organize.setChecked(False)
+
+    ctx.set_auto_organize(True)
+    assert ctx.panel.auto_check.isChecked() is True
+    assert ctx.act_auto_organize.isChecked() is True
+    assert ctx.config["autoOrganize"] is True
+
+    ctx.set_auto_organize(False)
+    assert ctx.panel.auto_check.isChecked() is False
+    assert ctx.act_auto_organize.isChecked() is False
+
+
+def test_search_results_category_tag(ctx):
+    """搜索结果：图标视图只显示名称；紧凑列表行尾带分类标签。"""
+    search = next(w for w in ctx.widgets if w.title == "搜索")
+    path = os.path.join(ctx.config["storageRoot"], "文档", "报告.docx")
+
+    # 图标视图：走真实提交流程再回填
+    search.search_edit.setText("报告")
+    search._search_timer.stop()
+    search._run_search()
+    ctx.search_service.results_ready.emit(
+        search._search_seq, "报告", [("文档", path)])
+    assert search.list_widget.count() == 1
+    assert search.list_widget.item(0).text() == "报告.docx"   # 单元格窄，仅名称
+
+    # 紧凑列表：行尾带分类标签
+    search._switch_preview(False)
+    ctx.search_service.results_ready.emit(
+        search._search_seq, "报告", [("文档", path)])
+    assert search.list_widget.count() == 1
+    assert "（文档）" in search.list_widget.item(0).text()
+
+
+def test_empty_grid_guide_hint(ctx):
+    """空格子显示两行引导：主提示 + 右键操作提示。"""
+    doc = next(w for w in ctx.widgets if w.title == "文档")
+    doc.refresh()
+    assert doc.list_widget.count() == 2
+    assert "拖入" in doc.list_widget.item(0).text()
+    assert "右键" in doc.list_widget.item(1).text()
+
+
+def test_dialog_dark_theme_rules():
+    """全局 QSS 覆盖弹窗（QMessageBox/QInputDialog），不再出现亮色系统弹窗。"""
+    from main import APP_QSS
+
+    assert "QMessageBox" in APP_QSS
+    assert "QInputDialog" in APP_QSS
+    assert "QDialog" in APP_QSS
+
+
+def test_resize_hot_zone_widened(ctx):
+    """尺寸拖拽热区加宽到 8px：小尺寸格子上更容易命中边缘。"""
+    from PySide6.QtCore import QPoint
+
+    doc = next(w for w in ctx.widgets if w.title == "文档")
+    assert doc._edge_at(QPoint(7, 180)) == "left"    # 7px 处仍是热区（原 6px 不在）
+    assert doc._edge_at(QPoint(135, 180)) is None    # 中部空白仍是拖动窗口区

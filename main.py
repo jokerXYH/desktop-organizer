@@ -44,7 +44,7 @@ REFRESH_DEBOUNCE_MS = 400
 # 单实例互斥：本地套接字服务名（Windows 上对应命名管道）
 SINGLE_INSTANCE_KEY = "MyDeskOrganizer.SingleInstance"
 
-# 全局暗色 QSS：右键菜单与工具提示跟随应用主题
+# 全局暗色 QSS：右键菜单、工具提示与弹窗对话框跟随应用主题
 APP_QSS = """
 QMenu{background:#26282e;color:#e8eaed;border:1px solid #3a3d46;
       border-radius:8px;padding:4px;}
@@ -53,6 +53,18 @@ QMenu::item:selected{background:rgba(76,194,255,70);}
 QMenu::separator{height:1px;background:#3a3d46;margin:4px 6px;}
 QToolTip{background:#26282e;color:#e8eaed;border:1px solid #3a3d46;
          border-radius:6px;padding:4px;}
+QDialog,QMessageBox,QInputDialog{background:#1e2025;color:#e8eaed;}
+QDialog QLabel,QMessageBox QLabel,QInputDialog QLabel{
+      color:#e8eaed;background:transparent;}
+QDialog QPushButton,QMessageBox QPushButton{background:#2a2d34;
+      border:1px solid #3a3d46;border-radius:8px;padding:5px 16px;color:#e8eaed;}
+QDialog QPushButton:hover,QMessageBox QPushButton:hover{
+      background:#33373f;border-color:#4cc2ff;}
+QDialog QPushButton:pressed{background:#23262c;}
+QDialog QLineEdit,QInputDialog QLineEdit{background:#26282e;
+      border:1px solid #3a3d46;border-radius:8px;padding:5px 8px;color:#e8eaed;
+      selection-background-color:rgba(76,194,255,90);}
+QDialog QLineEdit:focus{border-color:#4cc2ff;}
 """
 
 
@@ -116,6 +128,7 @@ class AppContext:
         self.panel = ControlPanel(self)
         self.tray = None
         self.act_game_mode = None    # 托盘"游戏模式"菜单项（供状态同步）
+        self.act_auto_organize = None  # 托盘"自动整理"菜单项（供状态同步）
         self._game_mode = False
         self._widgets_hidden = False  # F7 手动隐藏状态（跨重建保留）
         self.file_clipboard: list = []  # 内部剪切板：右键"剪切"的文件路径（供跨格子粘贴）
@@ -708,6 +721,9 @@ class AppContext:
             self._auto_timer.stop()
             self._sync_auto_watcher()
             self.refresh_status("自动整理已关闭")
+        self.panel.set_auto_organize_checked(enabled)     # 面板与托盘同步，不触发回调
+        if self.act_auto_organize is not None:
+            self.act_auto_organize.setChecked(enabled)
 
     def set_auto_organize_delay(self, seconds: int):
         """设置自动整理前的静置等待时间（秒）。"""
@@ -882,9 +898,13 @@ def main():
     act_game = QAction("游戏模式 (F9)", menu, checkable=True)
     act_game.triggered.connect(
         lambda checked: ctx.set_game_mode(checked))
+    act_auto = QAction("自动整理新桌面文件", menu, checkable=True)
+    act_auto.setChecked(ctx.config.get("autoOrganize", False))
+    act_auto.triggered.connect(
+        lambda checked: ctx.set_auto_organize(checked))
     act_quit = QAction("退出", menu)
     act_quit.triggered.connect(app.quit)
-    for act in (act_panel, act_toggle, act_game):
+    for act in (act_panel, act_toggle, act_game, act_auto):
         menu.addAction(act)
     menu.addSeparator()
     menu.addAction(act_quit)
@@ -898,6 +918,7 @@ def main():
     tray.show()
     ctx.tray = tray
     ctx.act_game_mode = act_game
+    ctx.act_auto_organize = act_auto
 
     if hotkeys_failed:
         tray.showMessage("部分热键不可用",
