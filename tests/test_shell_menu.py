@@ -79,3 +79,13 @@ def test_cli_action_parses_organize_flag():
 
     assert main.cli_action(["main.py"]) == "show"
     assert main.cli_action(["main.py", "--organize"]) == "organize"
+
+
+def test_update_wait_pid_parses_flag():
+    """--updated-from <pid> 参数解析（自更新后新实例等待旧进程退出）。"""
+    import main
+
+    assert main.update_wait_pid(["main.py", "--updated-from", "4321"]) == 4321
+    assert main.update_wait_pid(["main.py"]) is None
+    assert main.update_wait_pid(["main.py", "--updated-from", "abc"]) is None
+    assert main.update_wait_pid(["main.py", "--updated-from"]) is None

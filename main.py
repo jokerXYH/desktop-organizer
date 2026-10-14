@@ -29,6 +29,7 @@ import config as cfg
 import organizer as org
 import shell_menu
 import shortcut
+import updater
 from control_panel import ControlPanel
 from search_service import SearchService
 from widgets import (BUILTIN_GRID_NAMES, SEARCH_GRID_TITLE, WIDGET_GAP,
@@ -134,6 +135,17 @@ def notify_running_instance(message: bytes = b"show") -> bool:
 def cli_action(argv) -> str:
     """从命令行参数解析本次启动意图："organize"（一键整理）或 "show"（默认唤起面板）。"""
     return "organize" if "--organize" in list(argv) else "show"
+
+
+def update_wait_pid(argv):
+    """解析 --updated-from <pid>：自更新接力时新实例需要等待的旧进程 PID。"""
+    args = list(argv)
+    if "--updated-from" not in args:
+        return None
+    try:
+        return int(args[args.index("--updated-from") + 1])
+    except (IndexError, ValueError):
+        return None
 
 
 def make_tray_icon() -> QIcon:
@@ -1215,6 +1227,14 @@ class AppContext:
 
 def main():
     """程序入口：初始化 Qt 应用、注册热键、构建托盘与格子。"""
+    # 自更新接力：新版本 exe 先等旧进程退出、清理 *.old，随后正常启动
+    # （apply_update 会把旧 exe 改名为 *.old 再放新文件，见 updater.py）
+    wait_pid = update_wait_pid(sys.argv)
+    if wait_pid is not None:
+        updater.wait_for_process_exit(wait_pid)
+        if getattr(sys, "frozen", False):
+            updater.cleanup_old_exe(sys.executable)
+
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)  # 关闭面板不退出，常驻托盘
     app.setApplicationName("桌面分类助手")

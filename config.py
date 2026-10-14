@@ -11,7 +11,7 @@ import sys
 from typing import Any, Dict, List
 
 # 应用版本号（语义化版本：主版本.次版本.修订号；与 README / CHANGELOG 同步更新）
-APP_VERSION = "2.9.2"
+APP_VERSION = "2.10.0"
 
 # 配置目录与文件路径常量
 CONFIG_DIR = os.path.join(
@@ -61,6 +61,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "autoOrganize": False,                         # 自动整理新出现的桌面文件
     "autoOrganizeDelay": 300,                      # 自动整理前的静置等待（秒）
     "searchGrid": True,                            # 桌面搜索格子（常驻，可删除）
+    "updateUrl": "",                               # 新版本清单 JSON 的地址（留空=不检查）
     "confirmOrganize": True,                       # 一键整理前先预览确认
     "panelGeometry": "",                           # 控制面板位置记忆："x,y,w,h"
     "categories": ["文档", "图片", "视频", "音频", "压缩包", "安装包",

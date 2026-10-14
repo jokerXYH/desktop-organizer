@@ -20,7 +20,7 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import (QColor, QFont, QImage, QLinearGradient, QPainter,
                            QPixmap, QRadialGradient)
 from PySide6.QtWidgets import QApplication
@@ -131,19 +131,20 @@ def make_background(width, height):
     return image
 
 
-def draw_widget(painter, widget_pixmap, x, y):
-    """把控件画到画布上（带柔和投影）。
+def draw_widget(painter, widget_pixmap, x, y, scale=1.0):
+    """把控件画到画布上（带柔和投影；scale > 1 或 < 1 时等比缩放）。
 
     grab() 得到的位图带 devicePixelRatio=2：drawPixmap 按**逻辑尺寸**绘制，
     所以阴影矩形也必须换算回逻辑尺寸，否则会画出 2 倍大的"幽灵盒子"。
     """
     ratio = widget_pixmap.devicePixelRatio() or 1.0
-    width = widget_pixmap.width() / ratio
-    height = widget_pixmap.height() / ratio
+    width = widget_pixmap.width() / ratio * scale
+    height = widget_pixmap.height() / ratio * scale
     painter.setPen(Qt.NoPen)
     painter.setBrush(QColor(0, 0, 0, 90))
     painter.drawRoundedRect(x + 8, y + 12, width, height, 16, 16)
-    painter.drawPixmap(x, y, widget_pixmap)
+    painter.drawPixmap(QRectF(x, y, width, height), widget_pixmap,
+                       QRectF(widget_pixmap.rect()))
 
 
 def main():
@@ -180,12 +181,12 @@ def main():
     # ---- hero.png：总览 ----
     canvas = make_background(1920, 1080)
     painter = QPainter(canvas)
-    draw_widget(painter, grab(doc_widget), 110, 130)
-    draw_widget(painter, grab(pic_widget), 400, 130)
-    draw_widget(painter, grab(zip_widget), 690, 130)
-    draw_widget(painter, grab(search_widget), 980, 130)
-    draw_widget(painter, grab(folder_compact), 110, 550)
-    draw_widget(painter, grab(panel), 1400, 170)
+    draw_widget(painter, grab(doc_widget), 110, 150)
+    draw_widget(painter, grab(pic_widget), 400, 150)
+    draw_widget(painter, grab(zip_widget), 690, 150)
+    draw_widget(painter, grab(folder_compact), 110, 570)
+    draw_widget(painter, grab(search_widget), 690, 570)
+    draw_widget(painter, grab(panel), 1020, 150, scale=0.78)
     painter.setPen(QColor("#e8eaed"))
     painter.setFont(QFont("Microsoft YaHei UI", 17, QFont.DemiBold))
     painter.drawText(110, 1020, "桌面分类助手 · 悬浮分类格子 / 一键整理 / 拼音搜索")

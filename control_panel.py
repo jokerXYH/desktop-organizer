@@ -7,6 +7,10 @@ v2：新增开机自启、游戏模式、预览方式切换、收纳库搜索与
 """
 import html
 import os
+import subprocess
+import sys
+import tempfile
+import webbrowser
 
 from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
@@ -20,10 +24,11 @@ import autostart
 import config as cfg
 import organizer as org
 import shell_menu
+import updater
 from widgets import COLOR_ACCENT, COLOR_TEXT, COLOR_TEXT_DIM, open_in_shell
 
-PANEL_WIDTH = 480    # 面板宽度
-PANEL_HEIGHT = 760   # 面板高度
+PANEL_WIDTH = 1000   # 面板宽度（横向三栏布局）
+PANEL_HEIGHT = 620   # 面板高度
 SEARCH_DEBOUNCE_MS = 300          # 搜索输入防抖
 SEARCH_RESULT_LIMIT = 100         # 搜索结果上限（与 organizer.search_storage 一致）
 
@@ -159,9 +164,10 @@ def build_about_html(changelog_text: str, storage_root: str = "") -> str:
 <li>一键整理桌面：整理前预览确认，所有移动可撤销；桌面右键 / 托盘菜单均可触发</li>
 <li>收纳库搜索（拼音全拼与首字母）、拖动收纳与取出、格子整齐排列与收起</li>
 <li>全局快捷键：F7 显示/隐藏格子、F8 控制面板、F9 游戏模式</li>
+<li>版本更新：控制面板「检查更新」可检测新版本并一键升级（exe 形态自动替换并重启）</li>
 <li>收纳库位置：{storage}</li>
 <li>配置位置：{config_dir}</li>
-<li>隐私：所有文件与配置都保存在本机；不联网、不上传、不收集任何数据</li>
+<li>隐私：所有文件与配置都保存在本机；平时不联网、不上传、不收集任何数据（仅在你点击「检查更新」时访问你填写的更新源）</li>
 </ul>
 
 <h3>更新日志</h3>
@@ -172,8 +178,8 @@ def build_about_html(changelog_text: str, storage_root: str = "") -> str:
 删除操作均送往回收站。仍请在使用前自行备份重要数据，并确认整理结果。</p>
 <p>本软件按“原样”提供，不附带任何明示或暗示的担保；因使用本软件造成的任何数据
 丢失或损失，作者不承担责任。</p>
-<p>隐私说明：本软件完全在本地运行，不会连接网络，不会上传、收集或分享任何文件与
-使用数据。</p>
+<p>隐私说明：本软件完全在本地运行，不会上传、收集或分享任何文件与使用数据；唯一
+可能的联网行为是你主动点击「检查更新」时访问你自己填写的更新源。</p>
 </body></html>"""
 
 
@@ -219,53 +225,84 @@ class ControlPanel(QWidget):
         super().__init__()
         self.ctx = ctx
         self.setWindowTitle(f"桌面分类助手 v{cfg.APP_VERSION} - 控制面板")
-        # 高度按屏幕可用空间钳制：1366×768 等小屏笔记本上不会被任务栏截断
+        # 横向三栏布局：宽高都按屏幕可用空间钳制（小屏笔记本不会被截断）
         screen = QApplication.primaryScreen().availableGeometry()
-        self.resize(PANEL_WIDTH, min(PANEL_HEIGHT, screen.height() - 80))
+        self.resize(min(PANEL_WIDTH, screen.width() - 40),
+                    min(PANEL_HEIGHT, screen.height() - 80))
         self.setStyleSheet(PANEL_QSS)
         self._restore_geometry()          # 恢复上次关闭时的面板位置与大小
 
+        # ---- 横向三栏布局：左=整理操作 / 中=格子与开关 / 右=搜索·更新·关于 ----
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
+        body = QHBoxLayout()
+        body.setSpacing(18)
 
-        # ---- 第一行：整理操作按钮 ----
-        action_row = QHBoxLayout()
+        # ============ 左栏：整理操作 ============
+        left = QVBoxLayout()
+        left.setSpacing(8)
+        actions_label = QLabel("整理桌面")
+        actions_label.setObjectName("sectionLabel")
+        left.addWidget(actions_label)
         self.organize_btn = QPushButton("一键整理桌面")
         self.organize_btn.setObjectName("accentBtn")
         self.organize_btn.setFont(QFont("Microsoft YaHei UI", 10, QFont.Bold))
         self.organize_btn.clicked.connect(self._do_organize)
+        left.addWidget(self.organize_btn)
+        action_row = QHBoxLayout()
         self.undo_btn = QPushButton("撤销上次整理")
         self.undo_btn.clicked.connect(self._do_undo)
         self.restore_btn = QPushButton("恢复全部")
         self.restore_btn.clicked.connect(self._do_restore)
-        for btn in (self.organize_btn, self.undo_btn, self.restore_btn):
-            action_row.addWidget(btn)
-        layout.addLayout(action_row)
+        action_row.addWidget(self.undo_btn)
+        action_row.addWidget(self.restore_btn)
+        left.addLayout(action_row)
 
-        # ---- 第二行：收纳目录设置 ----
+        root_label = QLabel("收纳目录")
+        root_label.setObjectName("sectionLabel")
+        left.addWidget(root_label)
         cfg_row = QHBoxLayout()
-        root_label = QLabel("收纳目录:")
         self.root_edit = QLineEdit()
         self.root_edit.setText(self.ctx.config.get("storageRoot", ""))
         self.root_edit.editingFinished.connect(self._save_root)
         browse_btn = QPushButton("浏览...")
         browse_btn.clicked.connect(self._browse_root)
-        cfg_row.addWidget(root_label)
-        cfg_row.addWidget(self.root_edit)
+        cfg_row.addWidget(self.root_edit, 1)
         cfg_row.addWidget(browse_btn)
-        layout.addLayout(cfg_row)
+        left.addLayout(cfg_row)
 
-        # ---- 快捷启动：一键在桌面与开始菜单生成启动快捷方式 ----
-        launch_row = QHBoxLayout()
-        launch_label = QLabel("快捷启动:")
+        launch_label = QLabel("快捷启动")
         launch_label.setObjectName("sectionLabel")
+        left.addWidget(launch_label)
         self.shortcut_btn = QPushButton("创建快捷方式（桌面 + 开始菜单）")
         self.shortcut_btn.clicked.connect(self._create_shortcuts)
-        launch_row.addWidget(launch_label)
-        launch_row.addWidget(self.shortcut_btn)
-        layout.addLayout(launch_row)
+        left.addWidget(self.shortcut_btn)
+        left.addStretch()
+        body.addLayout(left, 3)
 
-        # ---- 第三行：功能开关（自启 / 游戏模式 / 收录选项 / 预览方式） ----
+        # ============ 中栏：格子与功能开关 ============
+        middle = QVBoxLayout()
+        middle.setSpacing(8)
+        cat_label = QLabel("显示的格子（分类）")
+        cat_label.setObjectName("sectionLabel")
+        middle.addWidget(cat_label)
+        cat_row = QHBoxLayout()
+        self.add_grid_btn = QPushButton("＋ 新建格子")
+        self.add_grid_btn.clicked.connect(self._create_grid)
+        self.map_folder_btn = QPushButton("映射文件夹…")
+        self.map_folder_btn.clicked.connect(self.ctx.map_folder_interactive)
+        cat_row.addWidget(self.add_grid_btn)
+        cat_row.addWidget(self.map_folder_btn)
+        cat_row.addStretch()
+        middle.addLayout(cat_row)
+        self._cat_grid = QGridLayout()
+        self._cat_grid.setHorizontalSpacing(10)
+        middle.addLayout(self._cat_grid)
+        self._rebuild_category_checks()
+
+        option_label = QLabel("功能开关")
+        option_label.setObjectName("sectionLabel")
+        middle.addWidget(option_label)
         option_grid = QGridLayout()
         self.shortcut_check = GlassCheckBox("整理时收走快捷方式")
         self.shortcut_check.setChecked(
@@ -332,49 +369,64 @@ class ControlPanel(QWidget):
         self.shell_menu_check.setToolTip(shell_menu.platform_menu_hint())
         self.shell_menu_check.toggled.connect(self._toggle_shell_menu)
         option_grid.addWidget(self.shell_menu_check, 6, 0)
-        layout.addLayout(option_grid)
+        middle.addLayout(option_grid)
+        middle.addStretch()
+        body.addLayout(middle, 3)
 
-        # ---- 第四行：分类格子开关（勾选即显示；支持自定义格子） ----
-        cat_row = QHBoxLayout()
-        cat_label = QLabel("显示的格子（分类）:")
-        cat_label.setObjectName("sectionLabel")
-        self.add_grid_btn = QPushButton("＋ 新建格子")
-        self.add_grid_btn.clicked.connect(self._create_grid)
-        self.map_folder_btn = QPushButton("映射文件夹…")
-        self.map_folder_btn.clicked.connect(self.ctx.map_folder_interactive)
-        cat_row.addWidget(cat_label)
-        cat_row.addStretch()
-        cat_row.addWidget(self.add_grid_btn)
-        cat_row.addWidget(self.map_folder_btn)
-        layout.addLayout(cat_row)
-        self._cat_grid = QGridLayout()
-        layout.addLayout(self._cat_grid)
-        self._rebuild_category_checks()
-
-        # ---- 第五行：收纳库搜索 ----
-        search_label = QLabel("搜索收纳库:")
+        # ============ 右栏：搜索 / 版本与更新 / 关于 ============
+        right = QVBoxLayout()
+        right.setSpacing(8)
+        search_label = QLabel("搜索收纳库")
         search_label.setObjectName("sectionLabel")
-        layout.addWidget(search_label)
+        right.addWidget(search_label)
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("输入文件名关键词，如：报告")
-        layout.addWidget(self.search_edit)
+        right.addWidget(self.search_edit)
         self.search_list = QListWidget()
         self.search_list.itemDoubleClicked.connect(self._open_search_item)
-        layout.addWidget(self.search_list, 1)   # 拉伸占据剩余空间
+        right.addWidget(self.search_list, 1)   # 拉伸占据右栏剩余空间
         locate_row = QHBoxLayout()
         locate_btn = QPushButton("打开所在位置")
         locate_btn.clicked.connect(self._locate_search_item)
         locate_row.addStretch()
         locate_row.addWidget(locate_btn)
-        layout.addLayout(locate_row)
+        right.addLayout(locate_row)
 
-        # 关于：详情介绍 / 更新日志 / 免责声明（纯本地展示，无网络请求）
+        update_label = QLabel("版本与更新")
+        update_label.setObjectName("sectionLabel")
+        right.addWidget(update_label)
+        update_row = QHBoxLayout()
+        self.version_label = QLabel(f"当前版本 v{cfg.APP_VERSION}")
+        self.version_label.setStyleSheet(
+            f"color:{COLOR_TEXT_DIM};background:transparent;")
+        update_row.addWidget(self.version_label)
+        update_row.addStretch()
+        self.update_btn = QPushButton("检查更新")
+        self.update_btn.clicked.connect(self._check_update)
+        update_row.addWidget(self.update_btn)
+        right.addLayout(update_row)
+        url_row = QHBoxLayout()
+        url_label = QLabel("更新源:")
+        self.update_url_edit = QLineEdit()
+        self.update_url_edit.setPlaceholderText(
+            "新版本清单 JSON 地址（留空=不可检查）")
+        self.update_url_edit.setText(self.ctx.config.get("updateUrl", ""))
+        self.update_url_edit.editingFinished.connect(self._save_update_url)
+        url_row.addWidget(url_label)
+        url_row.addWidget(self.update_url_edit, 1)
+        right.addLayout(url_row)
+
         about_row = QHBoxLayout()
         self.about_btn = QPushButton("关于（详情 / 更新日志 / 免责声明）")
         self.about_btn.clicked.connect(self._show_about)
         about_row.addStretch()
         about_row.addWidget(self.about_btn)
-        layout.addLayout(about_row)
+        right.addLayout(about_row)
+        body.addLayout(right, 4)
+
+        layout.addLayout(body, 1)
+
+        # ---- 第五行：搜索与关于已并入右栏（见上方三栏布局） ----
 
         # 搜索防抖：停止输入 300ms 后才提交请求
         self._search_timer = QTimer(self)
@@ -390,6 +442,13 @@ class ControlPanel(QWidget):
         if self.ctx.search_service is not None:
             self.ctx.search_service.results_ready.connect(
                 self._on_search_results)
+
+        # 检查更新：网络请求只在用户点击后发起（后台线程，同搜索服务模式）
+        self.update_service = updater.UpdateService(self)
+        self.update_service.checked.connect(self._on_update_checked)
+        self.update_service.downloaded.connect(self._on_update_downloaded)
+        self.update_service.progress.connect(self._on_update_progress)
+        self._pending_manifest = None
 
         # ---- 状态栏 ----
         self.status_label = QLabel("就绪")
@@ -598,6 +657,90 @@ class ControlPanel(QWidget):
         """打开「关于」对话框（详情介绍 / 更新日志 / 免责声明）。"""
         AboutDialog(self, self.ctx.config.get("storageRoot", "")).exec()
 
+    # ---------- 版本更新 ----------
+
+    def _save_update_url(self):
+        """保存更新源地址（值未变化时不写配置）。"""
+        text = self.update_url_edit.text().strip()
+        if text == str(self.ctx.config.get("updateUrl", "")):
+            return
+        self.ctx.config["updateUrl"] = text
+        cfg.save_config(self.ctx.config)
+        self.ctx.refresh_status("更新源已保存" if text else "已清空更新源")
+
+    def _check_update(self):
+        """点击「检查更新」：后台拉取新版本清单（唯一的主动联网入口）。"""
+        url = self.update_url_edit.text().strip()
+        if not url:
+            QMessageBox.information(
+                self, "检查更新",
+                "请先在下方填写更新源地址（新版本清单 JSON 的地址）。")
+            return
+        self.update_btn.setEnabled(False)
+        self.ctx.refresh_status("正在检查更新…")
+        self.update_service.check(url)
+
+    def _on_update_checked(self, ok: bool, payload):
+        """清单返回：无新版本提示最新；有新版本弹确认（源码模式打开下载页）。"""
+        self.update_btn.setEnabled(True)
+        if not ok:
+            self.ctx.refresh_status("检查更新失败（网络或地址问题）")
+            QMessageBox.warning(self, "检查更新失败", str(payload))
+            return
+        manifest = payload
+        if not updater.is_newer(manifest["version"], cfg.APP_VERSION):
+            self.ctx.refresh_status(f"已是最新版本 v{cfg.APP_VERSION}")
+            QMessageBox.information(
+                self, "检查更新", f"已是最新版本（v{cfg.APP_VERSION}）。")
+            return
+        notes = manifest["notes"] or "（作者未填写更新说明）"
+        answer = QMessageBox.question(
+            self, "发现新版本",
+            f"发现新版本 v{manifest['version']}（当前 v{cfg.APP_VERSION}）。"
+            f"\n\n更新说明：\n{notes}\n\n现在更新吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if answer != QMessageBox.Yes:
+            return
+        if not getattr(sys, "frozen", False):
+            # 源码模式：打开下载页，由用户手动更新（不覆盖正在使用的源码）
+            webbrowser.open(manifest["page"])
+            self.ctx.refresh_status("已打开下载页（源码模式请手动更新）")
+            return
+        self._pending_manifest = manifest
+        self.update_btn.setEnabled(False)
+        self.ctx.refresh_status(f"正在下载 v{manifest['version']}… 0%")
+        dest = os.path.join(
+            tempfile.gettempdir(),
+            f"桌面分类助手_v{manifest['version']}.exe")
+        self.update_service.download(
+            manifest["url"], dest, manifest["sha256"])
+
+    def _on_update_progress(self, percent: int):
+        """下载进度回填状态栏。"""
+        self.ctx.refresh_status(f"正在下载新版本… {percent}%")
+
+    def _on_update_downloaded(self, ok: bool, payload: str):
+        """下载完成：替换程序文件并重启到新版本（失败时保持原样并提示）。"""
+        if not ok:
+            self.update_btn.setEnabled(True)
+            self.ctx.refresh_status("更新下载失败")
+            QMessageBox.warning(self, "更新失败", payload)
+            return
+        try:
+            exe = updater.apply_update(sys.executable, payload)
+        except OSError as exc:
+            self.update_btn.setEnabled(True)
+            self.ctx.refresh_status("更新失败（程序文件被占用？）")
+            QMessageBox.critical(
+                self, "更新失败",
+                f"替换程序文件失败：{exc}\n可稍后重试或手动更新。")
+            return
+        version = (self._pending_manifest or {}).get("version", "")
+        self.ctx.refresh_status(f"更新完成，正在重启到 v{version}…")
+        # 启动新版本并退出当前进程；新实例会先等旧进程退出（--updated-from）
+        subprocess.Popen([exe, "--updated-from", str(os.getpid())])
+        QApplication.instance().quit()
+
     def _create_shortcuts(self):
         """生成桌面与开始菜单快捷方式并汇报结果（含组合键提示）。"""
         try:
@@ -700,15 +843,16 @@ class ControlPanel(QWidget):
     # ---------- 窗口几何记忆 ----------
 
     def _restore_geometry(self):
-        """恢复上次关闭时的面板位置与大小；越界或首次运行时居中显示。
+        """恢复上次关闭时的面板位置与大小；旧版竖版尺寸或越界时用横向默认布局。
 
-        恢复的尺寸同样按屏幕钳制（换到小屏显示器后不会超界）。
+        横向改版后旧几何（宽 480）不再适配：宽度 < 800 的历史记忆直接忽略、
+        居中显示新默认尺寸；恢复的尺寸同样按屏幕钳制（换到小屏显示器不会超界）。
         """
         screen = QApplication.primaryScreen().availableGeometry()
         saved = cfg.parse_geometry(self.ctx.config.get("panelGeometry", ""))
-        if saved and self.ctx._position_visible(*saved):
-            width = max(320, min(int(saved[2]), screen.width() - 40))
-            height = max(400, min(int(saved[3]), screen.height() - 80))
+        if saved and saved[2] >= 800 and self.ctx._position_visible(*saved):
+            width = max(600, min(int(saved[2]), screen.width() - 40))
+            height = max(420, min(int(saved[3]), screen.height() - 80))
             self.resize(width, height)
             self.move(saved[0], saved[1])
             return

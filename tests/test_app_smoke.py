@@ -31,9 +31,11 @@ def ctx(tmp_path, monkeypatch):
     context = AppContext()
     context.rebuild_widgets()
     yield context
-    # 清空后台搜索任务并等线程收尾，避免残留后台线程向已销毁控件发信号
+    # 清空后台搜索/更新任务并等线程收尾，避免残留后台线程向已销毁控件发信号
     context.search_service.pool.clear()
     context.search_service.pool.waitForDone(1000)
+    context.panel.update_service.pool.clear()
+    context.panel.update_service.pool.waitForDone(1000)
     for widget in context.widgets:
         widget.close()
     context.panel.close()
@@ -999,3 +1001,60 @@ def test_shell_menu_toggle_rolls_back_on_error(ctx, monkeypatch):
 
     assert not ctx.panel.shell_menu_check.isChecked()   # 勾选回滚
     assert warnings                                     # 有弹窗提示
+
+
+# ---------- v2.10.0 横向面板与检查更新 ----------
+
+def test_panel_is_horizontal_layout(ctx):
+    """控制面板为横向布局：默认宽度大于高度，且按屏钳制。"""
+    from control_panel import PANEL_HEIGHT, PANEL_WIDTH
+
+    assert PANEL_WIDTH > PANEL_HEIGHT
+    assert ctx.panel.width() >= ctx.panel.height()
+
+
+def test_panel_ignores_legacy_vertical_geometry(ctx):
+    """旧版竖版几何记忆（宽 480）不再适配：忽略并用新横向默认尺寸居中显示。"""
+    from control_panel import ControlPanel, PANEL_WIDTH
+
+    ctx.config["panelGeometry"] = "50,50,480,730"
+    panel = ControlPanel(ctx)
+    try:
+        screen = QApplication.primaryScreen().availableGeometry()
+        expected = min(PANEL_WIDTH, screen.width() - 40)
+        assert panel.width() == expected
+    finally:
+        panel.close()
+
+
+def test_panel_has_update_section(ctx):
+    """面板包含版本与更新区：当前版本 / 检查更新按钮 / 更新源输入框。"""
+    assert ctx.panel.update_btn.text() == "检查更新"
+    assert cfg.APP_VERSION in ctx.panel.version_label.text()
+    assert hasattr(ctx.panel, "update_url_edit")
+
+
+def test_check_update_requires_url(ctx, monkeypatch):
+    """未配置更新源时点击「检查更新」：提示先填写更新源，不发任何请求。"""
+    from PySide6.QtWidgets import QMessageBox
+
+    ctx.panel.update_url_edit.setText("")
+    hints = []
+    monkeypatch.setattr(
+        QMessageBox, "information",
+        staticmethod(lambda *args, **kwargs: hints.append(args)))
+    called = []
+    monkeypatch.setattr(ctx.panel.update_service, "check",
+                        lambda url: called.append(url))
+
+    ctx.panel._check_update()
+
+    assert hints and "更新源" in hints[0][2]
+    assert called == []
+
+
+def test_save_update_url(ctx):
+    """更新源地址保存进配置。"""
+    ctx.panel.update_url_edit.setText("https://example.com/update.json")
+    ctx.panel._save_update_url()
+    assert cfg.load_config()["updateUrl"] == "https://example.com/update.json"

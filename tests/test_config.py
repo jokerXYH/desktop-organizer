@@ -88,7 +88,7 @@ def test_defaults_contain_v2_keys():
                 "confirmOrganize", "panelGeometry", "widgetScales",
                 "widgetPreviews", "gridPaths", "autoOrganize",
                 "autoOrganizeDelay", "searchGrid", "widgetCollapsed",
-                "shellMenu"):
+                "shellMenu", "updateUrl"):
         assert key in cfg.DEFAULT_CONFIG
     assert cfg.FOLDER_CATEGORY in cfg.DEFAULT_CONFIG["categories"]
 
