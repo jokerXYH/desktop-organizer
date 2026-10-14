@@ -978,3 +978,11 @@ python -m pytest tests/ -q    # 期望 143 passed
   未配置不发请求/更新源保存）、`--updated-from` 解析 1 例。
 - 回归：`$env:QT_QPA_PLATFORM="offscreen"; python -m pytest tests/ -q` → **203 passed**。
 - 截图已重新生成（hero 展示横向面板 + 版本与更新区）。
+
+### 发布规范（每版照做，v2.10.0 起）
+1. 升版本：`config.APP_VERSION` 与 CHANGELOG / README / PROJECT 同步；
+2. 打包：`python tools/build_exe.py` → `dist/桌面分类助手_v<版本>.exe`（文件名自带版本号）；
+3. 提交推送后，在 GitHub 发 Release（tag `v<版本>`），把该 exe 作为附件上传；
+4. 更新仓库根 `update.json`（version / url / sha256 / notes）——应用内「检查更新」
+   默认指向 `raw.githubusercontent.com/jokerXYH/desktop-organizer/main/update.json`；
+5. 冒烟：旧版 exe 打开 → 检查更新 → 确认后应自动下载、替换并重启（源码形态只打开下载页）。

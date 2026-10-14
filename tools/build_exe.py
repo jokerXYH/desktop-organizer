@@ -5,7 +5,7 @@
     python tools/build_exe.py             # 无控制台黑窗（推荐，与快捷方式一致）
     python tools/build_exe.py --console   # 保留控制台，便于排查启动崩溃
 输出：
-    dist/桌面分类助手.exe
+    dist/桌面分类助手_v<版本号>.exe（版本号取自 config.APP_VERSION）
 
 要点：
     --onefile    单文件；收纳库默认生成在 exe 同级的"收纳库"目录
@@ -18,7 +18,11 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-APP_NAME = "桌面分类助手"
+sys.path.insert(0, ROOT)
+
+import config as cfg  # noqa: E402  版本号与源码保持同步
+
+APP_NAME = f"桌面分类助手_v{cfg.APP_VERSION}"   # 产物文件名自带版本号
 
 
 def build_command(console: bool = False) -> list:

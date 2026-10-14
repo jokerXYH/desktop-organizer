@@ -42,6 +42,12 @@
 
 > 截图由 `tools/make_readme_screenshots.py` 使用合成的演示数据生成，不含任何真实个人文件。
 
+## 下载
+
+- **最新版（GitHub Releases）**：<https://github.com/jokerXYH/desktop-organizer/releases/latest>
+  免安装单文件 exe，双击即用；首次运行会在 exe 同级创建「收纳库」文件夹，资料都保存在本机。
+- **应用内更新**：控制面板「版本与更新」→「检查更新」，exe 版可下载并自动替换重启。
+
 ## 运行
 
 环境要求：**Windows 10/11**、**Python 3.9+**（依赖见 `requirements.txt`）。
@@ -57,7 +63,7 @@ python main.py
 # 方式一：在控制面板点「创建快捷方式（桌面 + 开始菜单）」，双击 .lnk 即启动
 # 方式二：打包成免安装的独立 exe（目标机器无需装 Python）
 pip install pyinstaller
-python tools/build_exe.py            # 生成 dist/桌面分类助手.exe
+python tools/build_exe.py            # 生成 dist/桌面分类助手_v<版本号>.exe
 python tools/build_exe.py --console  # 保留控制台，便于排查启动问题
 ```
 
