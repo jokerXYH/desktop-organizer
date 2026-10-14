@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 import config as cfg  # noqa: E402
 import organizer as org  # noqa: E402
 from main import AppContext  # noqa: E402
+from widgets import COLLAPSED_HEIGHT, WIDGET_GAP  # noqa: E402
 
 _APP = QApplication.instance() or QApplication(sys.argv)
 
@@ -846,3 +847,108 @@ def test_organize_reports_oserror_instead_of_crashing(ctx, monkeypatch):
     ctx.panel._do_organize()                      # 不应抛异常
 
     assert messages and "磁盘只读" in messages[0]
+
+
+# ---------- v2.9.1 外观与对齐 ----------
+
+# 与真机 settings.json 同形的 8 分类 4 列 × 2 行凌乱现场
+USER_CATEGORIES = ["文档", "图片", "压缩包", "安装包", "代码", "快捷方式",
+                   "文件夹", "其他"]
+USER_COORDS = {
+    "文档": (1608, 21, 310, 414),
+    "图片": (642, 448, 330, 540),
+    "压缩包": (1302, 18, 304, 429),
+    "安装包": (1302, 448, 304, 538),
+    "代码": (979, 18, 303, 432),
+    "快捷方式": (979, 448, 303, 537),
+    "其他": (642, 18, 330, 432),
+    "文件夹": (1623, 448, 312, 536),
+}
+
+
+def _arrange_user_like_layout(ctx):
+    """把测试上下文布置成"真机同形的凌乱现场"（供整齐排列用例使用）。"""
+    ctx.config["categories"] = list(USER_CATEGORIES)
+    ctx.set_search_grid(False)          # 聚焦 8 个分类格子的栅格（顺带重建）
+    for widget in ctx.widgets:
+        if widget.title in USER_COORDS:
+            widget.setGeometry(*USER_COORDS[widget.title])
+
+
+def test_tidy_layout_produces_even_grid(ctx):
+    """整齐排列：凌乱布局归一为统一 16px 间距的规整栅格，并写回配置。"""
+    _arrange_user_like_layout(ctx)
+
+    ctx.tidy_layout()
+
+    # 列：按 x 分组后列内左缘一致、列间统一 16px
+    columns = {}
+    for widget in ctx.widgets:
+        columns.setdefault(widget.x(), []).append(widget)
+    xs = sorted(columns)
+    assert len(xs) == 4
+    for left, right in zip(xs, xs[1:]):
+        col_right = max(w.x() + w.width() for w in columns[left])
+        assert right - col_right == WIDGET_GAP
+
+    # 行：上缘一致、行间距 16px；轻微尺寸差异被统一（文档 414→432 等）
+    doc = next(w for w in ctx.widgets if w.title == "文档")
+    folder = next(w for w in ctx.widgets if w.title == "文件夹")
+    assert (doc.width(), doc.height()) == (312, 432)
+    assert (folder.width(), folder.height()) == (312, 540)
+    assert folder.y() - (doc.y() + doc.height()) == WIDGET_GAP
+
+    # 结果已持久化（位置 + 统一后的尺寸）
+    saved = cfg.load_config()
+    assert saved["widgetPositions"]["文档"] == f"{doc.x()},{doc.y()}"
+    assert saved["widgetSizes"]["文档"] == "312,432"
+
+
+def test_tidy_layout_second_run_is_noop(ctx):
+    """再点一次「整齐排列」不应有任何变化（幂等）。"""
+    _arrange_user_like_layout(ctx)
+    ctx.tidy_layout()
+    before = [(w.x(), w.y(), w.width(), w.height()) for w in ctx.widgets]
+    ctx.tidy_layout()
+    after = [(w.x(), w.y(), w.width(), w.height()) for w in ctx.widgets]
+    assert before == after
+
+
+def test_collapse_state_persists_across_rebuild(ctx):
+    """收起状态写入配置并在重建后保留；展开恢复原高度。"""
+    doc = next(w for w in ctx.widgets if w.title == "文档")
+    doc.set_collapsed(True)
+    assert doc.height() == COLLAPSED_HEIGHT
+    assert cfg.load_config()["widgetCollapsed"]["文档"] is True
+
+    ctx.rebuild_widgets()
+    doc2 = next(w for w in ctx.widgets if w.title == "文档")
+    assert doc2.height() == COLLAPSED_HEIGHT
+
+    doc2.set_collapsed(False)
+    assert doc2.height() > COLLAPSED_HEIGHT
+    assert cfg.load_config()["widgetCollapsed"]["文档"] is False
+
+
+def test_new_widget_default_placement_no_overlap(ctx):
+    """无位置记忆的格子按右侧列排队落位，不与任何已有格子重叠。"""
+    ctx.config["widgetPositions"].pop("文档", None)
+    cfg.save_config(ctx.config)
+
+    ctx.rebuild_widgets()
+
+    doc = next(w for w in ctx.widgets if w.title == "文档")
+    for other in ctx.widgets:
+        if other is doc:
+            continue
+        assert not doc.geometry().intersects(other.geometry())
+
+
+def test_rebuild_positions_are_stable(ctx):
+    """同一配置重复重建：所有格子位置尺寸保持一致（默认布局可收敛）。"""
+    before = {w.grid_key: (w.x(), w.y(), w.width(), w.height())
+              for w in ctx.widgets}
+    ctx.rebuild_widgets()
+    after = {w.grid_key: (w.x(), w.y(), w.width(), w.height())
+             for w in ctx.widgets}
+    assert before == after

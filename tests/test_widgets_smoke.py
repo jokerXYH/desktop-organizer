@@ -9,11 +9,11 @@ import pytest  # noqa: E402
 from PySide6.QtCore import QSize, Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication, QListView  # noqa: E402
 
-from widgets import (COMPACT_ICON_PX, FileWidget, MIN_WIDGET_H,  # noqa: E402
-                     MIN_WIDGET_W, SCALE_MAX, SCALE_MIN, SearchWidget,
-                     _icon_stats, _url_icon_file, decode_thumbnail,
-                     get_file_icon, get_thumbnail_service, is_thumbnailable,
-                     scale_geometry)
+from widgets import (COLLAPSED_HEIGHT, COMPACT_ICON_PX, FileWidget,  # noqa: E402
+                     MIN_WIDGET_H, MIN_WIDGET_W, SCALE_MAX, SCALE_MIN,
+                     SearchWidget, _icon_stats, _url_icon_file,
+                     decode_thumbnail, get_file_icon, get_thumbnail_service,
+                     is_thumbnailable, scale_geometry)
 
 _APP = QApplication.instance() or QApplication(sys.argv)
 
@@ -505,3 +505,64 @@ def test_drag_out_declares_move_only():
     """
     from widgets import DRAG_ACTION
     assert DRAG_ACTION == Qt.MoveAction
+
+
+def test_collapse_toggle_keeps_expanded_height(tmp_path):
+    """收起只剩标题栏高度、展开还原原高度，并回调通知外部持久化。"""
+    widget = _make_widget(tmp_path)
+    widget.resize(300, 400)
+    events = []
+    widget.on_collapse_changed = lambda w, collapsed: events.append(collapsed)
+
+    widget.set_collapsed(True)
+
+    assert widget.height() == COLLAPSED_HEIGHT
+    assert widget.list_widget.isHidden()
+    assert events == [True]
+
+    widget.set_collapsed(False)
+
+    assert widget.height() == 400
+    assert not widget.list_widget.isHidden()
+    assert events == [True, False]
+    widget.close()
+
+
+def test_double_click_title_collapses_but_list_does_not(tmp_path):
+    """双击标题栏收起；双击列表区域（打开文件）不触发收起。"""
+    from PySide6.QtCore import QEvent, QPointF
+    from PySide6.QtGui import QMouseEvent
+
+    widget = _make_widget(tmp_path)
+
+    def dblclick(y):
+        local = QPointF(30, y)
+        event = QMouseEvent(
+            QEvent.Type.MouseButtonDblClick, local,
+            QPointF(widget.mapToGlobal(local.toPoint())),
+            Qt.LeftButton, Qt.LeftButton, Qt.NoModifier)
+        QApplication.sendEvent(widget, event)
+
+    dblclick(10)                              # 标题栏：收起
+    assert widget.height() == COLLAPSED_HEIGHT
+
+    widget.set_collapsed(False)
+    height = widget.height()
+    dblclick(120)                             # 列表区域：不收起
+    assert widget.height() == height
+    widget.close()
+
+
+def test_context_menu_has_tidy_and_collapse(tmp_path):
+    """右键菜单包含「整齐排列全部格子」与「收起/展开格子」。"""
+    from PySide6.QtCore import QPoint
+
+    widget = _make_widget(tmp_path)
+    texts = [act.text() for act in widget._build_menu(QPoint(-1, -1)).actions()]
+    assert any("整齐排列" in text for text in texts)
+    assert any("收起" in text for text in texts)
+
+    widget.set_collapsed(True)
+    texts = [act.text() for act in widget._build_menu(QPoint(-1, -1)).actions()]
+    assert any("展开" in text for text in texts)
+    widget.close()

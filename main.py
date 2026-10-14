@@ -30,8 +30,9 @@ import organizer as org
 import shortcut
 from control_panel import ControlPanel
 from search_service import SearchService
-from widgets import (BUILTIN_GRID_NAMES, SEARCH_GRID_TITLE, FileWidget,
-                     GuideOverlay, SearchWidget)
+from widgets import (BUILTIN_GRID_NAMES, SEARCH_GRID_TITLE, WIDGET_GAP,
+                     FileWidget, GuideOverlay, SearchWidget,
+                     plan_default_placement, plan_tidy_layout)
 
 # Windows 全局热键常量
 WM_HOTKEY = 0x0312        # 热键消息编号
@@ -227,15 +228,16 @@ class AppContext:
 
         root = self.config["storageRoot"]
         screen = QApplication.primaryScreen().availableGeometry()
-        x = screen.right() - 300          # 靠屏幕右侧竖向排列
-        y = screen.top() + 40
         positions = self.config.get("widgetPositions", {})
         sizes = self.config.get("widgetSizes", {})
         scales = self.config.get("widgetScales", {})
         previews = self.config.get("widgetPreviews", {})
         mapped = self.config.get("gridPaths", {})
         titles = self.config.get("gridTitles", {})   # 显示名记忆：{分类键: 显示名}
+        collapsed_map = self.config.get("widgetCollapsed", {})
         need_save_default = False         # 是否有格子的位置需要写回配置
+        placed_rects: list = []           # 已落位格子的矩形：新格子据此避开重叠
+        pending: list = []                # 没有有效记忆位置的格子：统一排队落位
         for name in self.config.get("categories", []):
             folder = mapped.get(name) or os.path.join(root, name)
             display = titles.get(name, name)   # 内置分类改名后：键不变，只换显示名
@@ -264,23 +266,33 @@ class AppContext:
                 clipboard_count=self.clipboard_count,
                 guide_show=self.show_guides,
                 guide_hide=self.hide_guides,
+                collapsed=bool(collapsed_map.get(name, False)),
+                on_collapse_changed=self.handle_collapse_changed,
+                on_tidy_layout=self.tidy_layout,
                 grid_key=name)
             saved = cfg.parse_position(positions.get(name, ""))
             if saved and self._position_visible(saved[0], saved[1],
                                                 widget.width(), widget.height()):
                 widget.move(QPoint(*saved))       # 恢复上次拖动后的位置
+                placed_rects.append(QRect(
+                    widget.x(), widget.y(), widget.width(), widget.height()))
             else:
                 if saved:
                     need_save_default = True      # 记忆位置已越界，回退默认布局
-                # 超出屏幕高度时换一列
-                if y + widget.height() > screen.bottom():
-                    y = screen.top() + 40
-                    x -= widget.width() + 20
-                widget.move(QPoint(x, y))
+                pending.append(widget)
                 need_save_default = True
             widget.show()
             self.widgets.append(widget)
-            y += widget.height() + 16
+
+        # 无记忆位置的格子统一排队落位：贴右侧列下方，放不下就在整块左侧开新列
+        for widget in pending:
+            anchored = [rect for rect in placed_rects
+                        if screen.intersects(rect)]
+            point = plan_default_placement(
+                anchored, (widget.width(), widget.height()), screen)
+            widget.move(point)
+            placed_rects.append(QRect(point.x(), point.y(),
+                                      widget.width(), widget.height()))
 
         # 桌面搜索条：扁平形态（只有搜索框高度）、常驻桌面、可删除；位置记忆键名固定为"搜索"
         if self.config.get("searchGrid", False):
@@ -298,7 +310,8 @@ class AppContext:
                 metrics_scale=search_metrics,
                 on_zoom_changed=self.handle_zoom_changed,
                 guide_show=self.show_guides,
-                guide_hide=self.hide_guides)
+                guide_hide=self.hide_guides,
+                on_tidy_layout=self.tidy_layout)
             saved = cfg.parse_position(positions.get(name, ""))
             if saved and self._position_visible(saved[0], saved[1],
                                                 search_widget.width(),
@@ -344,6 +357,63 @@ class AppContext:
                        if w.title == SEARCH_GRID_TITLE), None)
         if search is not None:
             search.refresh()
+
+    # ---------- 外观对齐（整齐排列 / 收起） ----------
+
+    def tidy_layout(self):
+        """整齐排列：把可见格子整理为统一 16px 间距、边缘对齐的规整栅格。
+
+        只调整几何（位置 + 容差内统一的尺寸），不触碰文件；同屏格子按屏分组、
+        各自整理；已收起的格子只参与对位并锁定尺寸（展开高度记忆不被覆盖）。
+        """
+        groups = {}
+        for widget in self.widgets:
+            if not widget.isVisible():
+                continue
+            screen = QApplication.screenAt(widget.geometry().center()) \
+                or QApplication.primaryScreen()
+            groups.setdefault(screen, []).append(widget)
+        if not groups:
+            self.refresh_status("没有可见的格子可整理")
+            return
+
+        changed = 0
+        for screen, screen_widgets in groups.items():
+            rects = [QRect(w.x(), w.y(), w.width(), w.height())
+                     for w in screen_widgets]
+            fixed = [bool(getattr(w, "_collapsed", False))
+                     for w in screen_widgets]
+            plan = plan_tidy_layout(
+                rects, screen.availableGeometry(), fixed=fixed)
+            for widget, rect in zip(screen_widgets, plan):
+                if widget.geometry() != rect:
+                    widget.setGeometry(rect)
+                    changed += 1
+
+        positions = self.config.setdefault("widgetPositions", {})
+        sizes = self.config.setdefault("widgetSizes", {})
+        for widget in self.widgets:
+            if not widget.isVisible():
+                continue
+            positions[widget.grid_key] = cfg.format_position(
+                widget.x(), widget.y())
+            if not getattr(widget, "_collapsed", False):
+                sizes[widget.grid_key] = cfg.format_position(
+                    widget.width(), widget.height())
+        cfg.save_config(self.config)
+        if changed:
+            self.refresh_status(
+                f"已整齐排列 {changed} 个格子（间距统一 {WIDGET_GAP}px）")
+        else:
+            self.refresh_status("格子已经排列整齐，无需调整")
+
+    def handle_collapse_changed(self, widget, collapsed: bool):
+        """收起/展开状态变化：写入配置（跨重建保留）。"""
+        self.config.setdefault(
+            "widgetCollapsed", {})[widget.grid_key] = bool(collapsed)
+        cfg.save_config(self.config)
+        self.refresh_status(
+            f"「{widget.title}」{'已收起' if collapsed else '已展开'}")
 
     def toggle_widgets(self):
         """F7 / 托盘菜单：显示或隐藏全部格子；游戏模式中按 F7 视为退出游戏模式。"""
@@ -1159,6 +1229,8 @@ def main():
     act_panel.triggered.connect(ctx.show_panel)
     act_toggle = QAction("显示/隐藏格子 (F7)", menu)
     act_toggle.triggered.connect(ctx.toggle_widgets)
+    act_tidy = QAction("整齐排列格子", menu)
+    act_tidy.triggered.connect(ctx.tidy_layout)
     act_game = QAction("游戏模式 (F9)", menu, checkable=True)
     act_game.triggered.connect(
         lambda checked: ctx.set_game_mode(checked))
@@ -1168,7 +1240,7 @@ def main():
         lambda checked: ctx.set_auto_organize(checked))
     act_quit = QAction("退出", menu)
     act_quit.triggered.connect(app.quit)
-    for act in (act_panel, act_toggle, act_game, act_auto):
+    for act in (act_panel, act_toggle, act_tidy, act_game, act_auto):
         menu.addAction(act)
     menu.addSeparator()
     menu.addAction(act_quit)

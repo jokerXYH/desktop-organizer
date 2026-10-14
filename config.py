@@ -11,7 +11,7 @@ import sys
 from typing import Any, Dict, List
 
 # 应用版本号（语义化版本：主版本.次版本.修订号；与 README / CHANGELOG 同步更新）
-APP_VERSION = "2.9.0"
+APP_VERSION = "2.9.1"
 
 # 配置目录与文件路径常量
 CONFIG_DIR = os.path.join(
@@ -53,6 +53,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "widgetSizes": {},                             # 格子窗口尺寸：{分类名: "宽,高"}（拖拽调整）
     "widgetScales": {},                            # 图标/列宽缩放：{分类名: 缩放比}
     "widgetPreviews": {},                          # 单格子预览方式：{分类名: True=图标视图}
+    "widgetCollapsed": {},                         # 收起状态：{分类键: True=已收起}
     "gridPaths": {},                               # 路径映射格子：{分类名: 映射的文件夹}
     "gridTitles": {},                              # 显示名记忆：{分类键: 显示名}
                                                    # 内置分类改名只改这里，分类键不变

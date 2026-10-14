@@ -36,6 +36,7 @@ WIDGET_HEIGHT = 360       # 格子高度（像素）
 BG_ALPHA = 208            # 玻璃主背景不透明度（比纯暗色更透，透出壁纸形成毛玻璃观感）
 CORNER_RADIUS = 12        # 圆角半径（收敛一些，避免大圆角带来的"气泡感"）
 TITLE_BAR_HEIGHT = 36     # 标题栏高度
+COLLAPSED_HEIGHT = TITLE_BAR_HEIGHT + 8   # 收起形态总高度：只剩标题行 + 上下边距
 ICON_SIZE = 38            # 图标模式下文件图标的边长（像素）
 GRID_CELL_W = 76          # 图标模式网格单元宽（保证每行 3 列排满）
 GRID_CELL_H = 84          # 图标模式网格单元高
@@ -72,6 +73,13 @@ SIZE_SAVE_DELAY_MS = 600        # 尺寸保存防抖（与位置保存同节奏�
 # 图标/列宽缩放（Ctrl+滚轮）：按档位缩放单元格，窗口尺寸不变
 SCALE_LEVELS = (0.75, 0.85, 1.0, 1.15, 1.3, 1.5)
 SCALE_MIN, SCALE_MAX = SCALE_LEVELS[0], SCALE_LEVELS[-1]
+
+# 统一间距系统：格子的间距与贴边外边距一律同一数值，外观才"对得齐"。
+# 一键「整齐排列」（plan_tidy_layout）与默认落位（plan_default_placement）共用。
+WIDGET_GAP = 16        # 格子之间的统一间距（水平与垂直一致）
+SCREEN_MARGIN = 16     # 贴屏幕边缘的统一外边距
+WIDTH_GROW_CAP = 32    # 排列时单列宽度统一的最大生长量（差异更大则不强行对齐）
+HEIGHT_GROW_CAP = 48   # 排列时同行高度统一的最大生长量（同上）
 
 # 图片缩略图：可直接像素解码的栅格图（svg/psd/ai/ico 交给系统图标，不做解码）
 THUMB_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
@@ -488,6 +496,137 @@ def scale_geometry(scale: float) -> dict:
     }
 
 
+def plan_tidy_layout(rects, screen, gap: int = WIDGET_GAP,
+                     margin: int = SCREEN_MARGIN, fixed=None):
+    """把一组格子矩形整理成"行列栅格"，返回与输入等长（顺序不变）的新 QRect 列表。
+
+    这是「整齐排列」的纯逻辑核心，只做几何计算、不依赖窗口对象，便于单测：
+    1) 按 x 区间重叠归列（同一列的格子左右缘对齐）；
+    2) 列内宽度、行内高度在容差内"只生长"地统一，让边缘完全对齐——
+       差异过大的（如收起的窄条、超长列表）不强行拉伸；
+    3) 行顶对齐、列/行间距统一为 gap；
+    4) 整块超出屏幕时平移回统一外边距以内（优先保证右缘不越界）。
+    fixed 为与 rects 等长的布尔列表：True 的矩形（收起态格子）锁定尺寸、
+    不参与统一，仅参与对位。
+    """
+    count = len(rects)
+    if count == 0:
+        return []
+    fixed_flags = list(fixed) if fixed else [False] * count
+    work = [QRect(r) for r in rects]
+
+    # 1) 按 x 区间重叠归列（从左到右扫描）
+    order = sorted(range(count), key=lambda i: (work[i].x(), work[i].y()))
+    columns = []
+    column_right = None
+    for index in order:
+        if columns and work[index].x() < column_right:
+            columns[-1].append(index)
+            column_right = max(column_right,
+                               work[index].x() + work[index].width())
+        else:
+            columns.append([index])
+            column_right = work[index].x() + work[index].width()
+    for column in columns:
+        column.sort(key=lambda i: (work[i].y(), work[i].x()))
+
+    # 2) 列内宽度统一（容差内只生长，绝不缩小）
+    column_widths = []
+    for column in columns:
+        target = max(work[i].width() for i in column)
+        for index in column:
+            if (not fixed_flags[index]
+                    and target - work[index].width() <= WIDTH_GROW_CAP):
+                work[index].setWidth(target)
+        column_widths.append(max(work[i].width() for i in column))
+
+    # 3) 行内高度统一（同样只生长）
+    row_count = max(len(column) for column in columns)
+    for row in range(row_count):
+        ids = [column[row] for column in columns if len(column) > row]
+        target = max(work[i].height() for i in ids)
+        for index in ids:
+            if (not fixed_flags[index]
+                    and target - work[index].height() <= HEIGHT_GROW_CAP):
+                work[index].setHeight(target)
+
+    # 4) 列 x 布局：从左到右、统一间距
+    cursor = min(r.x() for r in work)
+    for column, width in zip(columns, column_widths):
+        for index in column:
+            work[index].moveLeft(cursor)
+        cursor += width + gap
+
+    # 5) 行 y 布局：各列首行顶部对齐，列内自上而下堆叠
+    top = min(work[column[0]].y() for column in columns)
+    for column in columns:
+        row_top = top
+        for index in column:
+            work[index].moveTop(row_top)
+            row_top += work[index].height() + gap
+
+    # 6) 越界归位：先保证右/下缘不越界，再保证左/上缘不越界
+    dx = 0
+    right_limit = screen.x() + screen.width() - margin
+    right_edge = max(r.x() + r.width() for r in work)
+    if right_edge > right_limit:
+        dx = right_limit - right_edge
+    left_edge = min(r.x() for r in work) + dx
+    if left_edge < screen.x() + margin:
+        dx += (screen.x() + margin) - left_edge
+    dy = 0
+    bottom_limit = screen.y() + screen.height() - margin
+    bottom_edge = max(r.y() + r.height() for r in work)
+    if bottom_edge > bottom_limit:
+        dy = bottom_limit - bottom_edge
+    top_edge = min(r.y() for r in work) + dy
+    if top_edge < screen.y() + margin:
+        dy += (screen.y() + margin) - top_edge
+    if dx or dy:
+        for rect in work:
+            rect.translate(dx, dy)
+    return work
+
+
+def plan_default_placement(rects, size, screen, gap: int = WIDGET_GAP,
+                           margin: int = SCREEN_MARGIN):
+    """为"没有位置记忆"的新格子挑选落点（默认布局，纯逻辑可单测）。
+
+    优先级：① 贴到右侧列的下缘（右缘对齐统一外边距）；② 右侧列放不下时，
+    在整块左侧开新列、顶部与整块对齐；③ 两侧都放不下时贴左缘自上而下扫描空位。
+    """
+    width, height = int(size[0]), int(size[1])
+    left_limit = screen.x() + margin
+    right_limit = screen.x() + screen.width() - margin
+    bottom_limit = screen.y() + screen.height() - margin
+    top = screen.y() + margin
+
+    x = max(left_limit, right_limit - width)
+    zone = [r for r in rects if r.x() < x + width and r.x() + r.width() > x]
+    if zone:
+        y = max(r.y() + r.height() for r in zone) + gap
+    else:
+        y = top
+    if y + height <= bottom_limit:
+        return QPoint(x, y)
+
+    if rects:                                  # 整块左侧开新列
+        new_x = min(r.x() for r in rects) - gap - width
+        new_y = min(r.y() for r in rects)
+        if new_x >= left_limit:
+            return QPoint(new_x, new_y)
+
+    scan_x, scan_y = left_limit, top             # 兜底：自上而下扫描空位
+    for _ in range(50):
+        blocked = [r for r in rects
+                   if r.x() < scan_x + width and r.x() + r.width() > scan_x
+                   and r.y() < scan_y + height and r.y() + r.height() > scan_y]
+        if not blocked:
+            return QPoint(scan_x, scan_y)
+        scan_y = max(r.y() + r.height() for r in blocked) + gap
+    return QPoint(scan_x, scan_y)
+
+
 class FileListWidget(QListWidget):
     """文件列表控件：支持多选，并把选中的真实文件作为拖动源拖出到资源管理器/桌面/其它格子。
 
@@ -627,7 +766,8 @@ class FileWidget(QWidget):
                  on_zoom_changed=None, on_size_changed=None,
                  on_cut_files=None, on_paste_files=None,
                  clipboard_count=None, guide_show=None, guide_hide=None,
-                 grid_key=None, parent=None):
+                 collapsed: bool = False, on_collapse_changed=None,
+                 on_tidy_layout=None, grid_key=None, parent=None):
         """初始化格子。
 
         :param title: 格子标题（显示名，可被用户重命名）
@@ -652,6 +792,9 @@ class FileWidget(QWidget):
         :param clipboard_count: 返回当前剪切板条目数的回调（用于菜单文案与可用状态）
         :param guide_show: 显示对齐指示线回调，签名 (lines: list[QRect]，全局坐标)
         :param guide_hide: 隐藏对齐指示线回调
+        :param collapsed: 是否以收起形态启动（恢复上次的收起状态）
+        :param on_collapse_changed: 收起/展开回调，签名 (FileWidget, bool)
+        :param on_tidy_layout: 右键「整齐排列全部格子」回调（AppContext 统一整理）
         """
         super().__init__(parent)
         self.title = title             # 显示名（用户可见，可重命名）
@@ -673,6 +816,10 @@ class FileWidget(QWidget):
         self.clipboard_count = clipboard_count
         self.guide_show = guide_show
         self.guide_hide = guide_hide
+        self.on_collapse_changed = on_collapse_changed
+        self.on_tidy_layout = on_tidy_layout
+        self._collapsed = False        # 收起状态：只剩标题栏高度
+        self._expanded_height = None   # 收起前的高度（展开时还原）
         self.scale = 1.0               # 图标/列宽缩放比（1.0 = 基准 38px 图标）
         if metrics_scale is not None:
             try:
@@ -763,6 +910,8 @@ class FileWidget(QWidget):
         self._apply_window_size(*self._init_size)  # 应用窗口尺寸记忆
         self._apply_scale(self.scale)              # 应用图标/列宽缩放记忆
         self.set_preview(preview_icons)
+        if collapsed:
+            self.set_collapsed(True, notify=False)  # 恢复上次的收起形态
 
     # ---------- 外观绘制 ----------
 
@@ -811,8 +960,8 @@ class FileWidget(QWidget):
         painter.drawPath(inner)
 
         # 4) 标题分隔线：中间实、两端渐隐
-        # 扁平形态（搜索条）没有标题栏，画线反而像边框，直接跳过
-        if not self._bar_mode:
+        # 扁平形态（搜索条）没有标题栏、收起形态列表不可见：都直接跳过
+        if not self._bar_mode and not self._collapsed:
             separator = QLinearGradient(12, 0, self.width() - 12, 0)
             separator.setColorAt(0.0, QColor(255, 255, 255, 0))
             separator.setColorAt(0.5, COLOR_SEPARATOR)
@@ -891,6 +1040,56 @@ class FileWidget(QWidget):
         self._hide_guides()
         super().mouseReleaseEvent(event)
 
+    def mouseDoubleClickEvent(self, event):
+        """双击标题栏：收起/展开格子（Fences / 桌面整理类产品的通用交互）。
+
+        列表区域的双击属于"打开文件"，不在此处理。
+        """
+        if (event.button() == Qt.LeftButton and not self._bar_mode
+                and event.position().y() <= TITLE_BAR_HEIGHT):
+            self.set_collapsed(not self._collapsed)
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def contextMenuEvent(self, event):
+        """标题区（含收起形态）右键：弹出格子菜单；列表区仍由列表自身处理。"""
+        if not self._bar_mode and (self._collapsed
+                                   or event.pos().y() <= TITLE_BAR_HEIGHT):
+            self._build_menu(QPoint(-1, -1)).exec(event.globalPos())
+            event.accept()
+            return
+        super().contextMenuEvent(event)
+
+    # ---------- 收起 / 展开 ----------
+
+    def set_collapsed(self, collapsed: bool, notify: bool = True):
+        """收起/展开：收起后只剩标题栏高度，展开还原收起前的高度。
+
+        收起**不写尺寸记忆**：44px 的临时高度若被持久化，
+        下次启动展开时就找不到原来的高度了。
+        """
+        if self._bar_mode:
+            return                        # 扁平搜索条没有标题栏，不支持收起
+        collapsed = bool(collapsed)
+        if collapsed == self._collapsed:
+            return
+        self._collapsed = collapsed
+        if collapsed:
+            self._expanded_height = self.height()
+            self.list_widget.hide()
+            self.layout().activate()   # 先让布局排除已隐藏的列表，最小高度约束随之收紧
+            self.resize(self.width(), COLLAPSED_HEIGHT)
+        else:
+            self.list_widget.show()
+            self.layout().activate()
+            height = self._expanded_height or self._init_size[1]
+            self.resize(self.width(),
+                        max(MIN_WIDGET_H, min(MAX_WIDGET_H, int(height))))
+        self.update()                     # 重绘（收起时不画标题分隔线）
+        if notify and self.on_collapse_changed is not None:
+            self.on_collapse_changed(self, collapsed)
+
     def _apply_snap(self, pos, peers):
         """把拖动中的目标位置吸附到其它格子边缘；返回 (新位置, 对齐指示线)。
 
@@ -949,8 +1148,8 @@ class FileWidget(QWidget):
 
     def _edge_at(self, pos):
         """返回上下左右边缘/角落热区名称；不在热区内时返回 None。"""
-        if not self._resizable:
-            return None                    # 扁平搜索条：不允许拖边缘改尺寸
+        if not self._resizable or self._collapsed:
+            return None                    # 扁平搜索条 / 收起形态：不允许拖边缘改尺寸
         at_left = pos.x() < RESIZE_EDGE
         at_right = pos.x() >= self.width() - RESIZE_EDGE
         at_top = pos.y() < RESIZE_EDGE
@@ -1032,7 +1231,12 @@ class FileWidget(QWidget):
         return (left, top, width, height), guides
 
     def _emit_size(self):
-        """尺寸防抖到期：把当前窗口宽高上报给回调（持久化）。"""
+        """尺寸防抖到期：把当前窗口宽高上报给回调（持久化）。
+
+        收起形态的高度是临时的，不上报，避免覆盖展开时的尺寸记忆。
+        """
+        if self._collapsed:
+            return
         if self.on_size_changed is not None:
             self.on_size_changed(self)
 
@@ -1323,6 +1527,12 @@ class FileWidget(QWidget):
         menu.addAction("打开文件夹", self._open_folder)
         if not self._bar_mode:              # 扁平搜索条固定单列显示，无需预览方式
             self._show_preview_menu(menu)
+        menu.addAction("整齐排列全部格子",
+                       lambda: self.on_tidy_layout()
+                       if self.on_tidy_layout else None)
+        if not self._bar_mode:
+            menu.addAction("展开格子" if self._collapsed else "收起格子",
+                           lambda: self.set_collapsed(not self._collapsed))
         menu.addSeparator()
         act_rename = menu.addAction("重命名格子…")
         if self.grid_key == SEARCH_GRID_TITLE:
