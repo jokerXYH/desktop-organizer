@@ -72,7 +72,7 @@ python tools/build_exe.py --console  # 保留控制台，便于排查启动问�
 ## 测试
 
 ```bash
-python -m pytest tests/ -q    # 143 passed
+python -m pytest tests/ -q    # 154 passed
 ```
 
 ## 项目结构
@@ -88,5 +88,5 @@ widgets.py         格子窗口、搜索格子、对齐参考线、文件图标�
 control_panel.py   控制面板（整理、设置、搜索）
 assets/            应用图标 app_icon.ico（快捷方式与打包 exe 共用）
 tools/             开发辅助脚本（README 截图、应用图标生成、exe 打包）
-tests/             139 个自动化测试
+tests/             154 个自动化测试
 ```
