@@ -294,8 +294,9 @@ def get_file_icon(path: str):
     if fixed is not None:
         icon = fixed
 
-    if len(_FILE_ICON_CACHE) > 2000:                # 防呆：缓存过大时清空
-        _FILE_ICON_CACHE.clear()
+    if len(_FILE_ICON_CACHE) > 2000:                # 防呆：超限时批量淘汰最早的一半
+        for key in list(_FILE_ICON_CACHE)[:1000]:   # （原为整体清空：下一轮刷新
+            _FILE_ICON_CACHE.pop(key, None)         #   会出现全量重算的卡顿尖峰）
     _FILE_ICON_CACHE[key] = icon
     return icon
 
@@ -1138,13 +1139,17 @@ class SearchWidget(FileWidget):
     """桌面搜索格子：常驻桌面、可随时删除，输入关键词搜索收纳库与路径映射文件夹。
 
     - 输入防抖 300ms；支持拼音搜索（organizer.search_storage 内置）；
+    - 配 search_service 时搜索在后台线程执行，结果经序号+关键词双重校验回填；
+      未配置 service 时退化为前台同步搜索（保持旧行为，便于测试兜底）；
     - 结果条目双击打开，右键可打开所在位置/复制路径/剪切（配合目标格子粘贴移动）；
     - 位置/尺寸/图标缩放/锁定等记忆完全复用 FileWidget 的机制（键名固定为"搜索"）。
     """
 
     def __init__(self, on_search, *args, **kwargs):
-        self._on_search = on_search
+        self._on_search = on_search        # 同步搜索入口（降级/测试用）
+        self._service = kwargs.pop("search_service", None)
         self._search_ready = False
+        self._search_seq = 0               # 最近一次提交给后台的请求序号
         super().__init__(*args, **kwargs)
         self.title_label.setText(SEARCH_GRID_TITLE)
         self.count_label.setText("")
@@ -1152,6 +1157,8 @@ class SearchWidget(FileWidget):
         self.search_edit = QLineEdit(self)
         self.search_edit.setPlaceholderText("输入关键词搜索（支持拼音）")
         self.layout().insertWidget(1, self.search_edit)
+        if self._service is not None:
+            self._service.results_ready.connect(self._on_results)
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
         self._search_timer.timeout.connect(self._run_search)
@@ -1168,7 +1175,7 @@ class SearchWidget(FileWidget):
         self._run_search()
 
     def _run_search(self):
-        """执行搜索并填充结果列表。"""
+        """执行搜索并填充结果列表（有后台服务时改为提交请求）。"""
         keyword = self.search_edit.text().strip()
         self.list_widget.clear()
         if not keyword:
@@ -1179,7 +1186,20 @@ class SearchWidget(FileWidget):
             tip.setForeground(QBrush(QColor("#6a7080")))
             self.list_widget.addItem(tip)
             return
-        results = self._on_search(keyword) or []
+        if self._service is not None:
+            self._search_seq = self._service.start(keyword, MAX_LIST_ITEMS)
+            self.count_label.setText("搜索中…")
+        else:
+            self._fill_results(self._on_search(keyword) or [])
+
+    def _on_results(self, seq: int, keyword: str, results: list):
+        """后台搜索完成回填；序号或关键词不匹配（已过期）则丢弃。"""
+        if seq != self._search_seq or keyword != self.search_edit.text().strip():
+            return
+        self._fill_results(results or [])
+
+    def _fill_results(self, results: list):
+        """把搜索结果填充到列表并更新计数。"""
         self.count_label.setText(f"{len(results)} 项")
         for category, path in results[:MAX_LIST_ITEMS]:
             item = QListWidgetItem(os.path.basename(path))

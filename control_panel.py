@@ -190,12 +190,20 @@ class ControlPanel(QWidget):
         locate_row.addWidget(locate_btn)
         layout.addLayout(locate_row)
 
-        # 搜索防抖：停止输入 300ms 后才执行扫描
+        # 搜索防抖：停止输入 300ms 后才提交请求
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
         self._search_timer.timeout.connect(self._run_search)
         self.search_edit.textChanged.connect(
             lambda _t: self._search_timer.start(SEARCH_DEBOUNCE_MS))
+
+        # 搜索在后台线程执行（search_storage 全库遍历 + 拼音较慢）：
+        # 提交时记下服务端序号，结果回填时校验序号与关键词，过期结果丢弃
+        self._search_seq = 0
+        self._search_pending = False
+        if self.ctx.search_service is not None:
+            self.ctx.search_service.results_ready.connect(
+                self._on_search_results)
 
         # ---- 状态栏 ----
         self.status_label = QLabel("就绪")
@@ -390,19 +398,34 @@ class ControlPanel(QWidget):
     # ---------- 收纳库搜索 ----------
 
     def _run_search(self):
-        """执行收纳库递归搜索并填充结果列表。"""
+        """提交收纳库搜索请求（后台线程执行，UI 线程不再全库遍历）。"""
         keyword = self.search_edit.text()
         self.search_list.clear()
+        self._search_pending = False
         if not keyword.strip():
             self.ctx.refresh_status("输入关键词搜索收纳库")
             return
+        service = self.ctx.search_service
+        if service is not None:
+            self._search_pending = True
+            self._search_seq = service.start(keyword, SEARCH_RESULT_LIMIT)
+            self.ctx.refresh_status("搜索中…")
+        else:
+            self._apply_search_results(keyword,
+                                       self._search_now(keyword, SEARCH_RESULT_LIMIT))
+
+    def _search_now(self, keyword: str, limit: int) -> list:
+        """同步搜索（service 未配置时的降级路径，与后台逻辑一致）。"""
         root = self.ctx.config.get("storageRoot", "")
         mapped = [(name, path)
                   for name, path in self.ctx.config.get("gridPaths", {}).items()
                   if os.path.isdir(path)]
-        results = org.search_storage(root, keyword,
-                                     limit=SEARCH_RESULT_LIMIT,
-                                     extra_dirs=mapped)
+        return org.search_storage(root, keyword, limit=limit, extra_dirs=mapped)
+
+    def _apply_search_results(self, keyword: str, results: list):
+        """把搜索结果填充到面板列表并更新状态栏。"""
+        if self._search_pending:
+            self._search_pending = False
         for cat, path in results:
             item = QListWidgetItem(os.path.basename(path))
             item.setData(Qt.UserRole, path)
@@ -410,6 +433,14 @@ class ControlPanel(QWidget):
             self.search_list.addItem(item)
         note = "（已达上限，可细化关键词）" if len(results) >= SEARCH_RESULT_LIMIT else ""
         self.ctx.refresh_status(f"搜索到 {len(results)} 个结果{note}")
+
+    def _on_search_results(self, seq: int, keyword: str, results: list):
+        """后台搜索回填结果；序号不匹配或关键词已变（过期结果）则丢弃。"""
+        if seq != self._search_seq or not self._search_pending:
+            return
+        if keyword != self.search_edit.text():
+            return
+        self._apply_search_results(keyword, results or [])
 
     def _open_search_item(self, item):
         """双击搜索结果：用系统默认程序打开。"""

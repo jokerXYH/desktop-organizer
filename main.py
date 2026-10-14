@@ -25,8 +25,9 @@ import autostart
 import config as cfg
 import organizer as org
 from control_panel import ControlPanel
-from widgets import (SEARCH_GRID_TITLE, FileWidget, GuideOverlay,
-                     SearchWidget)
+from search_service import SearchService
+from widgets import (BUILTIN_GRID_NAMES, SEARCH_GRID_TITLE, FileWidget,
+                     GuideOverlay, SearchWidget)
 
 # Windows 全局热键常量
 WM_HOTKEY = 0x0312        # 热键消息编号
@@ -42,9 +43,6 @@ REFRESH_DEBOUNCE_MS = 400
 
 # 单实例互斥：本地套接字服务名（Windows 上对应命名管道）
 SINGLE_INSTANCE_KEY = "MyDeskOrganizer.SingleInstance"
-
-# 内置分类（由扩展名/文件夹规则决定，参与自动整理）：不可重命名
-BUILTIN_GRID_NAMES = set(org.CATEGORY_RULES) | {org.FOLDER_CATEGORY}
 
 # 全局暗色 QSS：右键菜单与工具提示跟随应用主题
 APP_QSS = """
@@ -110,6 +108,11 @@ class AppContext:
     def __init__(self):
         self.config = cfg.load_config()
         self.widgets: list = []
+        # 搜索后台服务：面板与搜索格子共享，全库遍历/拼音在后台线程执行
+        # （必须在 ControlPanel 之前创建：面板构造时会连接其信号）
+        self.search_service = SearchService(
+            lambda: self.config.get("storageRoot", ""),
+            lambda: list(self.config.get("gridPaths", {}).items()))
         self.panel = ControlPanel(self)
         self.tray = None
         self.act_game_mode = None    # 托盘"游戏模式"菜单项（供状态同步）
@@ -123,7 +126,8 @@ class AppContext:
         self.watcher.directoryChanged.connect(self._on_storage_changed)
         self._refresh_timer = QTimer()
         self._refresh_timer.setSingleShot(True)
-        self._refresh_timer.timeout.connect(self.refresh_all)
+        self._refresh_timer.timeout.connect(self._refresh_pending)
+        self._pending_dirs: set = set()   # 防抖窗口内累计的"发生变化的目录"
 
         # 自动整理：监听桌面，新文件静置一段时间（dwell）后收入收纳库；事件驱动无轮询
         self._auto_watcher = QFileSystemWatcher()
@@ -218,6 +222,7 @@ class AppContext:
                 search_metrics = 1.0
             search_widget = SearchWidget(
                 self.search_all, name, root, None,
+                search_service=self.search_service,
                 on_position_changed=self.handle_position_changed,
                 on_preview_changed=self.handle_preview_changed,
                 preview_icons=bool(previews.get(
@@ -253,6 +258,30 @@ class AppContext:
         """刷新所有格子的文件列表。"""
         for w in self.widgets:
             w.refresh()
+
+    def _refresh_pending(self):
+        """防抖到期：只刷新本次文件事件真正波及的格子。
+
+        QFileSystemWatcher 的信号携带事件源目录，防抖窗口内把目录聚合在
+        _pending_dirs 里，用"目录 → 对应格子"映射做定向刷新；
+        搜索格子收纳的是全库视图，只要有任何变化就重跑一次现有关键词
+        （关键词为空时代价可忽略）。此前的"任一变化 → 全量刷新"会让
+        路径映射的大目录格子被无关事件反复扫盘，这里一并修正。
+        """
+        dirs = set(self._pending_dirs)
+        self._pending_dirs.clear()
+        if not dirs:
+            return
+        for w in self.widgets:
+            if w.title == SEARCH_GRID_TITLE:
+                continue
+            folder_norm = os.path.normcase(os.path.abspath(str(w.folder or "")))
+            if folder_norm in dirs:
+                w.refresh()
+        search = next((w for w in self.widgets
+                       if w.title == SEARCH_GRID_TITLE), None)
+        if search is not None:
+            search.refresh()
 
     def toggle_widgets(self):
         """F7 / 托盘菜单：显示或隐藏全部格子；游戏模式中按 F7 视为退出游戏模式。"""
@@ -655,10 +684,11 @@ class AppContext:
         if removed:
             self.watcher.removePaths(removed)
 
-    def _on_storage_changed(self, _path: str):
-        """收纳库目录有改动（整理/拖入/外部增删）：防抖后统一刷新格子。"""
+    def _on_storage_changed(self, path: str):
+        """收纳库目录有改动（整理/拖入/外部增删）：防抖后定向刷新受影响格子。"""
         if self._game_mode or self._widgets_hidden:
             return                       # 游戏模式/隐藏期间不做无谓刷新
+        self._pending_dirs.add(os.path.normcase(str(path)))
         self._refresh_timer.start(REFRESH_DEBOUNCE_MS)
         # 防抖期间可能新建了分类目录，刷新时顺带补挂监听
         QTimer.singleShot(REFRESH_DEBOUNCE_MS + 50, self._sync_watcher_paths)

@@ -233,7 +233,7 @@ def test_auto_organize_new_files_only(ctx, tmp_path, monkeypatch):
 
 
 def test_search_grid(ctx):
-    """搜索格子：默认存在、支持拼音搜索、删除后消失、可在面板恢复。"""
+    """搜索格子：默认存在、支持拼音搜索（后台提交+结果回填）、删除后消失、可恢复。"""
     search = next(w for w in ctx.widgets if w.title == "搜索")
     root = ctx.config["storageRoot"]
     with open(os.path.join(root, "文档", "季度报告.docx"), "w",
@@ -241,7 +241,11 @@ def test_search_grid(ctx):
         handle.write("x")
 
     search.search_edit.setText("jidu")             # 拼音（季度）
-    search._run_search()
+    search._run_search()                           # 提交后台请求，先显示"搜索中…"
+    assert "搜索中" in search.count_label.text()
+    ctx.search_service.results_ready.emit(
+        search._search_seq, "jidu", ctx.search_service.run_now("jidu", 200))
+
     assert search.list_widget.count() == 1
     assert search.list_widget.item(0).data(Qt.UserRole).endswith("季度报告.docx")
     assert "1 项" in search.count_label.text()
@@ -252,6 +256,88 @@ def test_search_grid(ctx):
 
     ctx.set_search_grid(True)
     assert any(w.title == "搜索" for w in ctx.widgets)
+
+
+def test_search_grid_ignores_stale_results(ctx):
+    """后台搜索过期结果（序号已过期或关键词已变化）不得污染列表。"""
+    search = next(w for w in ctx.widgets if w.title == "搜索")
+    root = ctx.config["storageRoot"]
+    with open(os.path.join(root, "文档", "季度报告.docx"), "w",
+              encoding="utf-8") as handle:
+        handle.write("x")
+
+    search.search_edit.setText("jidu")
+    search._run_search()
+    first_seq = search._search_seq
+
+    # 用户改了关键词（防抖计时被手动停掉），此时第一个请求的结果才回来：
+    # 关键词与当前不一致 → 必须丢弃
+    search.search_edit.setText("完全不同的词")
+    search._search_timer.stop()
+    ctx.search_service.results_ready.emit(
+        first_seq, "jidu", ctx.search_service.run_now("jidu", 200))
+    assert search.list_widget.count() == 0
+
+    # 用当前关键词重新提交：序号已更新，回填正常生效（无命中=空列表）
+    search._run_search()
+    assert search._search_seq > first_seq
+    ctx.search_service.results_ready.emit(
+        search._search_seq, "完全不同的词",
+        ctx.search_service.run_now("完全不同的词", 200))
+    assert search.list_widget.count() == 0
+    assert search.count_label.text() == "0 项"
+
+
+def test_panel_search_async_and_stale_guard(ctx):
+    """面板搜索：提交为后台请求，过期结果不回填，最新结果正常填充与提示。"""
+    panel = ctx.panel
+    root = ctx.config["storageRoot"]
+    with open(os.path.join(root, "文档", "季度报表.xlsx"), "w",
+              encoding="utf-8") as handle:
+        handle.write("x")
+
+    panel.search_edit.setText("报表")
+    panel._run_search()
+    assert panel._search_pending is True
+    first_seq = panel._search_seq
+    assert "搜索中" in panel.status_label.text()
+
+    # 过期结果（关键词已变）到达：不回填
+    panel.search_edit.setText("别的词")
+    panel._search_timer.stop()
+    ctx.search_service.results_ready.emit(
+        first_seq, "报表", ctx.search_service.run_now("报表", 100))
+    assert panel.search_list.count() == 0
+
+    panel.search_edit.setText("报表")
+    panel._search_timer.stop()
+    panel._run_search()
+    ctx.search_service.results_ready.emit(
+        panel._search_seq, "报表", ctx.search_service.run_now("报表", 100))
+    assert panel.search_list.count() == 1
+    assert "搜索到 1 个结果" in panel.status_label.text()
+
+
+def test_targeted_refresh_only_affected_grids(ctx, monkeypatch):
+    """文件事件只刷新事件源目录对应的格子，防抖窗口内自动合并，不清空后重刷。"""
+    root = ctx.config["storageRoot"]
+    doc = next(w for w in ctx.widgets if w.title == "文档")
+    pics = next(w for w in ctx.widgets if w.title == "图片")
+    hits = {"文档": 0, "图片": 0}
+    monkeypatch.setattr(doc, "refresh",
+                        lambda: hits.__setitem__("文档", hits["文档"] + 1))
+    monkeypatch.setattr(pics, "refresh",
+                        lambda: hits.__setitem__("图片", hits["图片"] + 1))
+
+    ctx._on_storage_changed(os.path.join(root, "文档"))
+    ctx._on_storage_changed(os.path.join(root, "图片"))   # 防抖窗口内合并
+    assert ctx._refresh_timer.isActive()
+    ctx._refresh_timer.stop()
+    ctx._refresh_pending()
+
+    assert hits == {"文档": 1, "图片": 1}
+    ctx._refresh_pending()                                # 队列已清空，不重刷
+    assert hits == {"文档": 1, "图片": 1}
 
 
 def test_cut_paste_between_grids(ctx):
