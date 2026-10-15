@@ -950,13 +950,25 @@ def test_new_widget_default_placement_no_overlap(ctx):
 
 
 def test_rebuild_positions_are_stable(ctx):
-    """同一配置重复重建：所有格子位置尺寸保持一致（默认布局可收敛）。"""
+    """同一配置重复重建：所有格子位置尺寸保持一致（默认布局可收敛）。
+
+    v2.11.0 起：默认布局在极端小屏上可能生成越界位置，第一次重建会被
+    钳回屏幕内并写回配置——从第二次重建开始必须完全稳定，且全部在屏内。
+    """
+    from PySide6.QtCore import QRect
+
+    ctx.rebuild_widgets()                      # 第一次：越界位置收进屏内并写回
     before = {w.grid_key: (w.x(), w.y(), w.width(), w.height())
               for w in ctx.widgets}
     ctx.rebuild_widgets()
     after = {w.grid_key: (w.x(), w.y(), w.width(), w.height())
              for w in ctx.widgets}
     assert before == after
+    screen = QApplication.primaryScreen().availableGeometry()
+    for widget in ctx.widgets:                 # 全部格子必须可见地落在屏幕内
+        rect = QRect(widget.x(), widget.y(),
+                     widget.width(), widget.height())
+        assert screen.intersected(rect) == rect
 
 
 # ---------- v2.9.2 桌面右键菜单与关于页 ----------
@@ -1058,3 +1070,45 @@ def test_save_update_url(ctx):
     ctx.panel.update_url_edit.setText("https://example.com/update.json")
     ctx.panel._save_update_url()
     assert cfg.load_config()["updateUrl"] == "https://example.com/update.json"
+
+
+def test_panel_has_exit_entry(ctx):
+    """面板底栏提供「退出助手」与常用入口（用户反馈找不到退出）。"""
+    assert ctx.panel.exit_btn.text() == "退出助手"
+    assert ctx.panel.open_storage_btn.text() == "打开收纳库"
+    assert ctx.panel.open_config_btn.text() == "打开配置目录"
+    assert "关于" in ctx.panel.about_btn.text()
+
+
+def test_reclamp_brings_widgets_back_into_screen(ctx):
+    """换屏/分辨率变化后：reclamp 把越界格子收回屏内并把修正写回配置。"""
+    from PySide6.QtCore import QRect
+
+    doc = next(w for w in ctx.widgets if w.title == "文档")
+    screen = QApplication.primaryScreen().availableGeometry()
+    doc.setGeometry(281, screen.height() + 2000, 330, 400)   # 整块在屏幕下方
+
+    moved = ctx.reclamp_widgets()
+
+    assert moved >= 1
+    rect = QRect(doc.x(), doc.y(), doc.width(), doc.height())
+    assert screen.intersected(rect) == rect                    # 完完整整在屏内
+    assert cfg.load_config()["widgetPositions"]["文档"] == \
+        f"{doc.x()},{doc.y()}"                                 # 修正后的位置已写回
+
+
+def test_offscreen_saved_position_clamped_on_restart(ctx):
+    """启动恢复：屏幕外的记忆位置应被钳回屏内，而不是"藏在屏幕外面"。"""
+    from PySide6.QtCore import QRect
+
+    positions = ctx.config.setdefault("widgetPositions", {})
+    positions["文档"] = "281,99999"
+    cfg.save_config(ctx.config)
+
+    ctx.rebuild_widgets()
+
+    doc = next(w for w in ctx.widgets if w.title == "文档")
+    screen = QApplication.primaryScreen().availableGeometry()
+    rect = QRect(doc.x(), doc.y(), doc.width(), doc.height())
+    assert screen.intersected(rect) == rect
+    assert cfg.load_config()["widgetPositions"].get("文档") != "281,99999"

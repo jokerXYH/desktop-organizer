@@ -69,6 +69,12 @@ QScrollBar::handle:vertical{background:rgba(255,255,255,50);border-radius:4px;
 QScrollBar::handle:vertical:hover{background:#93a1b3;}
 QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}
 QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:transparent;}
+QPushButton#dangerBtn{background:rgba(224,82,82,38);border:1px solid rgba(255,120,120,120);
+                      color:#ffb9b9;font-weight:bold;}
+QPushButton#dangerBtn:hover{background:rgba(224,82,82,70);border-color:rgba(255,140,140,190);}
+QPushButton#dangerBtn:pressed{background:rgba(224,82,82,20);}
+QLabel#titleLabel{font-size:15px;font-weight:bold;}
+QLabel#versionTag{color:#9ba1ab;font-size:11px;padding-top:3px;}
 """
 
 
@@ -232,8 +238,22 @@ class ControlPanel(QWidget):
         self.setStyleSheet(PANEL_QSS)
         self._restore_geometry()          # 恢复上次关闭时的面板位置与大小
 
-        # ---- 横向三栏布局：左=整理操作 / 中=格子与开关 / 右=搜索·更新·关于 ----
         layout = QVBoxLayout(self)
+        # ---- 顶栏：标题 + 退出提示（用户反馈"找不到退出"，这里先给一句明确的） ----
+        header = QHBoxLayout()
+        title_label = QLabel("桌面分类助手")
+        title_label.setObjectName("titleLabel")
+        version_tag = QLabel(f"v{cfg.APP_VERSION}")
+        version_tag.setObjectName("versionTag")
+        header.addWidget(title_label)
+        header.addWidget(version_tag)
+        header.addStretch()
+        quit_hint = QLabel("关闭窗口只是收起（F8 可再打开）· 彻底退出请用右下角「退出助手」")
+        quit_hint.setObjectName("sectionLabel")
+        header.addWidget(quit_hint)
+        layout.addLayout(header)
+
+        # ---- 横向三栏布局：左=整理操作 / 中=格子与开关 / 右=搜索·更新·关于 ----
         layout.setSpacing(10)
         body = QHBoxLayout()
         body.setSpacing(18)
@@ -415,13 +435,6 @@ class ControlPanel(QWidget):
         url_row.addWidget(url_label)
         url_row.addWidget(self.update_url_edit, 1)
         right.addLayout(url_row)
-
-        about_row = QHBoxLayout()
-        self.about_btn = QPushButton("关于（详情 / 更新日志 / 免责声明）")
-        self.about_btn.clicked.connect(self._show_about)
-        about_row.addStretch()
-        about_row.addWidget(self.about_btn)
-        right.addLayout(about_row)
         body.addLayout(right, 4)
 
         layout.addLayout(body, 1)
@@ -450,11 +463,30 @@ class ControlPanel(QWidget):
         self.update_service.progress.connect(self._on_update_progress)
         self._pending_manifest = None
 
-        # ---- 状态栏 ----
+        # ---- 底栏：状态 + 常用入口 + 退出（面板上的"出口"，必须显眼） ----
+        footer = QHBoxLayout()
         self.status_label = QLabel("就绪")
         self.status_label.setStyleSheet(
             f"color:{COLOR_TEXT_DIM};background:transparent;padding:2px;")
-        layout.addWidget(self.status_label)
+        footer.addWidget(self.status_label, 1)
+        self.open_storage_btn = QPushButton("打开收纳库")
+        self.open_storage_btn.setToolTip("在资源管理器中打开收纳库目录")
+        self.open_storage_btn.clicked.connect(self._open_storage)
+        footer.addWidget(self.open_storage_btn)
+        self.open_config_btn = QPushButton("打开配置目录")
+        self.open_config_btn.setToolTip(f"配置与整理历史都在这里：{cfg.CONFIG_DIR}")
+        self.open_config_btn.clicked.connect(lambda: open_in_shell(cfg.CONFIG_DIR))
+        footer.addWidget(self.open_config_btn)
+        self.about_btn = QPushButton("关于")
+        self.about_btn.setToolTip("详情介绍 / 更新日志 / 免责声明")
+        self.about_btn.clicked.connect(self._show_about)
+        footer.addWidget(self.about_btn)
+        self.exit_btn = QPushButton("退出助手")
+        self.exit_btn.setObjectName("dangerBtn")
+        self.exit_btn.setToolTip("停止格子与文件监听并退出程序（收纳库、历史与设置都会保留）")
+        self.exit_btn.clicked.connect(self._request_quit)
+        footer.addWidget(self.exit_btn)
+        layout.addLayout(footer)
 
     # ---------- 操作回调 ----------
 
@@ -656,6 +688,33 @@ class ControlPanel(QWidget):
     def _show_about(self):
         """打开「关于」对话框（详情介绍 / 更新日志 / 免责声明）。"""
         AboutDialog(self, self.ctx.config.get("storageRoot", "")).exec()
+
+    def _open_storage(self):
+        """打开收纳库目录（不存在时只提示，不弹系统错误框）。"""
+        root = self.ctx.config.get("storageRoot", "")
+        if root and os.path.isdir(root):
+            open_in_shell(root)
+        else:
+            self.ctx.refresh_status("收纳目录不存在，请检查上方「收纳目录」设置")
+
+    def _request_quit(self):
+        """面板「退出助手」：确认后退出程序（AppContext 统一收尾并保存状态）。"""
+        answer = QMessageBox.question(
+            self, "退出桌面分类助手",
+            "确定要退出吗？\n\n"
+            "· 退出后桌面格子与文件监听都会停止；\n"
+            "· 收纳库文件、整理记录与设置都会保留，下次启动自动恢复；\n\n"
+            "（只想收起窗口的话：直接关掉本窗口即可，程序会继续在托盘运行；"
+            "想开机自动运行可在中栏勾选「开机自启」。）",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        self.save_geometry()
+        quit_fn = getattr(self.ctx, "request_quit", None)
+        if callable(quit_fn):
+            quit_fn()
+        else:
+            QApplication.instance().quit()
 
     # ---------- 版本更新 ----------
 

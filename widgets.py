@@ -496,6 +496,51 @@ def scale_geometry(scale: float) -> dict:
     }
 
 
+def current_screen_rects() -> list:
+    """当前所有屏幕的可用区域（QRect 列表），供拖动/缩放时的边界钳制使用。"""
+    return [screen.availableGeometry() for screen in QApplication.screens()]
+
+
+def _screen_relation(rect, screen) -> tuple:
+    """rect 与 screen 的关系评分：先看交集面积，无交集时看中心距离（越近越大）。"""
+    inter = screen.intersected(rect)
+    area = max(inter.width(), 0) * max(inter.height(), 0)
+    if area:
+        return area, 0
+    dx = max(screen.x() - rect.x(), rect.x() - (screen.x() + screen.width()), 0)
+    dy = max(screen.y() - rect.y(), rect.y() - (screen.y() + screen.height()), 0)
+    return 0, -(dx * dx + dy * dy)
+
+
+def nearest_screen_rect(rect, screens):
+    """挑选与 rect 关系最近的屏幕（交集面积优先，其次边缘距离）；screens 为空返回 None。"""
+    best = None
+    best_key = None
+    for screen in screens:
+        key = _screen_relation(rect, screen)
+        if best_key is None or key > best_key:
+            best, best_key = screen, key
+    return best
+
+
+def clamp_rect_to_screens(rect, screens) -> QRect:
+    """把矩形整体收进"最近的"屏幕内：先按屏幕收小尺寸，再平移保证四边不越界。
+
+    - 完全在屏内：原样返回（不产生任何副作用，可放心在热路径每次调用）；
+    - 部分越界（拖动、缩放、展开、换屏后）：平移回屏内；
+    - 尺寸比屏幕还大：先缩到屏幕大小（贴屏幕左上）；
+    - screens 为空（极端环境）：原样返回。
+    """
+    if not screens:
+        return QRect(rect)
+    screen = nearest_screen_rect(rect, screens)
+    width = min(rect.width(), screen.width())
+    height = min(rect.height(), screen.height())
+    x = min(max(rect.x(), screen.x()), screen.x() + screen.width() - width)
+    y = min(max(rect.y(), screen.y()), screen.y() + screen.height() - height)
+    return QRect(x, y, width, height)
+
+
 def plan_tidy_layout(rects, screen, gap: int = WIDGET_GAP,
                      margin: int = SCREEN_MARGIN, fixed=None):
     """把一组格子矩形整理成"行列栅格"，返回与输入等长（顺序不变）的新 QRect 列表。
@@ -997,6 +1042,11 @@ class FileWidget(QWidget):
             peers = self.snap_provider(self) if self.snap_provider else []
             geometry, guides = self._resize_geometry(
                 self._resize_edge, (x0, y0, width0, height0), delta, peers)
+            # 缩放同样不能越出屏幕：右/下缘拖过头时以屏幕边缘为界收住
+            clamped = clamp_rect_to_screens(
+                QRect(*geometry), current_screen_rects())
+            geometry = (clamped.x(), clamped.y(),
+                        clamped.width(), clamped.height())
             if guides:
                 self._show_guides(guides)
             else:
@@ -1016,6 +1066,10 @@ class FileWidget(QWidget):
                     self._show_guides(guides)
                 else:
                     self._hide_guides()
+            # 屏幕边界钳制：拖到边缘/拖出屏幕时，格子会停在屏幕可见区域内
+            pos = clamp_rect_to_screens(
+                QRect(pos, QSize(self.width(), self.height())),
+                current_screen_rects()).topLeft()
             self.move(pos)
             if self._position_ready:
                 self._pos_timer.start(POSITION_SAVE_DELAY_MS)
@@ -1041,6 +1095,7 @@ class FileWidget(QWidget):
         self._resize_from = None
         self._drag_pos = None
         self._hide_guides()
+        self._clamp_into_screens()       # 兜底：鼠标操作结束后保证完全在屏幕内
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):
@@ -1089,6 +1144,7 @@ class FileWidget(QWidget):
             height = self._expanded_height or self._init_size[1]
             self.resize(self.width(),
                         max(MIN_WIDGET_H, min(MAX_WIDGET_H, int(height))))
+        self._clamp_into_screens()       # 展开变高 / 收窄后：保证不越出屏幕
         self.update()                     # 重绘（收起时不画标题分隔线）
         if notify and self.on_collapse_changed is not None:
             self.on_collapse_changed(self, collapsed)
@@ -1133,6 +1189,22 @@ class FileWidget(QWidget):
         """隐藏对齐指示线。"""
         if self.guide_hide is not None:
             self.guide_hide()
+
+    def _clamp_into_screens(self) -> bool:
+        """把窗口整体收进最近的屏幕内；位置/尺寸真的被修正时保存并返回 True。
+
+        拖动、调整尺寸、收起/展开、搜索条展开都可能把窗口带出屏幕（拖到边缘、
+        换显示器、分辨率变化），这里做统一兜底：格子永远不会停在屏幕可见区域之外。
+        """
+        rect = QRect(self.x(), self.y(), self.width(), self.height())
+        clamped = clamp_rect_to_screens(rect, current_screen_rects())
+        if clamped == rect:
+            return False
+        self.setGeometry(clamped)
+        if self._position_ready:
+            self._emit_position()
+        self._size_timer.start(SIZE_SAVE_DELAY_MS)
+        return True
 
     def _clamp_size(self, size):
         """把尺寸记忆解析并钳制到允许范围；无效时返回默认尺寸。"""
@@ -1722,6 +1794,7 @@ class SearchWidget(FileWidget):
                       + rows * row_h + margins.bottom())
         if self.height() != height:
             self.resize(self.width(), height)
+        self._clamp_into_screens()       # 搜索条贴着屏幕底部时展开会越界：及时收回
 
     def _set_result_rows(self, rows: int):
         """更新结果行数并据此调整窗口高度（0 = 收起为纯搜索条）。"""

@@ -990,3 +990,41 @@ python -m pytest tests/ -q    # 期望 143 passed
    `github.com/jokerXYH/desktop-organizer/releases/latest/download/update.json`
    （实测 raw.githubusercontent 在国内直连不可达，release CDN 可达，故用附件方案）；
 5. 冒烟：旧版 exe 打开 → 检查更新 → 确认后应自动下载、替换并重启（源码形态只打开下载页）。
+
+## 29. v2.11.0 屏幕边界钳制 / 退出入口 / 面板顶底栏（2026-10-16）
+
+### 背景（用户实测）
+
+- 用户报告两件事：① 格子会"出现到桌面外面"；② Windows 10 下看不到托盘图标、
+  不知道程序在运行、**找不到退出入口**，要求重做面板。
+- 取证：`%APPDATA%/MyDeskOrganizer/settings.json` 中 5 个格子的记忆位置
+  （y=1360~3012）超出屏幕可用高度（1040）——整块在屏幕下方，桌面上不可见。
+  代码侧确认：拖动/缩放/展开无边界钳制；启动恢复只拦"完全不可见"的 80×80
+  判定；显示器变化无运行时响应。
+
+### 修复设计（defense in depth）
+
+- `widgets.py` 新增纯函数 `current_screen_rects / nearest_screen_rect /
+  clamp_rect_to_screens`（交集面积优先、无交集取边缘距离最近；超大窗口先收小
+  再贴左上；无屏幕时原样返回——纯逻辑可单测）。
+- `FileWidget._clamp_into_screens()`：统一兜底，被修改时才保存（位置/尺寸防抖）。
+  挂点：拖动 mouseMoveEvent、四边缩放、mouseReleaseEvent、set_collapsed、
+  SearchWidget 展开高度。
+- `main.rebuild_widgets`：恢复全部记忆位置时一律钳制并写回修正值（取代原
+  `_position_visible` 通过/回退二选一；该函数保留仅供面板几何使用）。
+- `AppContext._watch_screen_changes`：QGuiApplication.screenAdded / screenRemoved
+  + 每屏 geometryChanged / availableGeometryChanged → 400ms 防抖 →
+  `reclamp_widgets()` 收回并写回配置。
+- 托盘菜单新增「把所有格子移回屏幕内」（手动找回）。
+- 退出入口：面板底栏「退出助手」（红色 `#dangerBtn` + 确认框）→
+  `AppContext.request_quit`（面板 save_geometry → app.quit → aboutToQuit 保存全部）；
+  首次运行托盘气泡一次（配置键 `trayTipShown`）；托盘不可用时
+  `setQuitOnLastWindowClosed(True)` + 启动警告，任何环境都有明确出口。
+- 面板：顶栏（标题/版本/退出提示）+ 底栏（状态 + 打开收纳库/配置目录/关于/退出助手），
+  三栏内容不变（测试大量引用控件属性，一律保留原 attribute 名，只增不删）。
+
+### 测试
+
+- 203 → **214**：`tests/test_screen_clamp.py` 新增 8 例纯逻辑；
+  `test_app_smoke.py` 新增 3 例（reclamp 写回 / 启动钳制 / 退出入口）；
+  `test_rebuild_positions_are_stable` 改为"首轮钳制归一后逐轮稳定且全部在屏内"。

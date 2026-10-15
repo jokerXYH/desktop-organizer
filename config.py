@@ -11,7 +11,7 @@ import sys
 from typing import Any, Dict, List
 
 # 应用版本号（语义化版本：主版本.次版本.修订号；与 README / CHANGELOG 同步更新）
-APP_VERSION = "2.10.0"
+APP_VERSION = "2.11.0"
 
 # 配置目录与文件路径常量
 CONFIG_DIR = os.path.join(
@@ -64,6 +64,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "updateUrl": "https://github.com/jokerXYH/desktop-organizer/"
                  "releases/latest/download/update.json",  # 新版本清单地址（留空=不检查）
     "confirmOrganize": True,                       # 一键整理前先预览确认
+    "trayTipShown": False,                         # 托盘一次性提示是否已展示（提示退出入口）
     "panelGeometry": "",                           # 控制面板位置记忆："x,y,w,h"
     "categories": ["文档", "图片", "视频", "音频", "压缩包", "安装包",
                    "代码", "文件夹", "其他"],

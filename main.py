@@ -34,6 +34,7 @@ from control_panel import ControlPanel
 from search_service import SearchService
 from widgets import (BUILTIN_GRID_NAMES, SEARCH_GRID_TITLE, WIDGET_GAP,
                      FileWidget, GuideOverlay, SearchWidget,
+                     clamp_rect_to_screens, current_screen_rects,
                      plan_default_placement, plan_tidy_layout)
 
 # Windows 全局热键常量
@@ -223,6 +224,13 @@ class AppContext:
         self._auto_retry_timer.timeout.connect(self._confirm_and_collect)
         self._guide_overlay = None     # 拖动对齐指示线覆盖层（懒加载）
 
+        # 显示器增删 / 分辨率变化的防抖计时器：变化后把全部格子收回屏幕内，
+        # 防止拔掉副屏、改分辨率之后格子"留在屏幕外面"找不回来。
+        self._screen_timer = QTimer()
+        self._screen_timer.setSingleShot(True)
+        self._screen_timer.timeout.connect(self.reclamp_widgets)
+        self._watch_screen_changes()
+
     # ---------- 格子管理 ----------
 
     def _snapshot_grid_dirs(self) -> list:
@@ -244,7 +252,7 @@ class AppContext:
             os.makedirs(os.path.join(root, name), exist_ok=True)
 
     def rebuild_widgets(self):
-        """按当前配置重建全部桌面格子；有记忆位置则恢复，否则平铺摆放。"""
+        """按当前配置重建全部桌面格子；有记忆位置则恢复（越界自动钳回屏内），否则平铺摆放。"""
         for w in self.widgets:
             w.close()
         self.widgets.clear()
@@ -296,14 +304,19 @@ class AppContext:
                 on_organize_desktop=self.organize_now,
                 grid_key=name)
             saved = cfg.parse_position(positions.get(name, ""))
-            if saved and self._position_visible(saved[0], saved[1],
-                                                widget.width(), widget.height()):
-                widget.move(QPoint(*saved))       # 恢复上次拖动后的位置
-                placed_rects.append(QRect(
-                    widget.x(), widget.y(), widget.width(), widget.height()))
+            if saved:
+                # 恢复上次拖动后的位置；越界（换屏/分辨率变化）一律钳回屏幕内，
+                # 并把修正后的坐标写回配置——格子永远不会"藏在屏幕外面"
+                clamped = clamp_rect_to_screens(
+                    QRect(saved[0], saved[1], widget.width(), widget.height()),
+                    current_screen_rects())
+                widget.move(clamped.topLeft())
+                placed_rects.append(clamped)
+                if (clamped.x(), clamped.y()) != (saved[0], saved[1]):
+                    positions[name] = cfg.format_position(
+                        clamped.x(), clamped.y())
+                    need_save_default = True
             else:
-                if saved:
-                    need_save_default = True      # 记忆位置已越界，回退默认布局
                 pending.append(widget)
                 need_save_default = True
             widget.show()
@@ -339,10 +352,16 @@ class AppContext:
                 on_tidy_layout=self.tidy_layout,
                 on_organize_desktop=self.organize_now)
             saved = cfg.parse_position(positions.get(name, ""))
-            if saved and self._position_visible(saved[0], saved[1],
-                                                search_widget.width(),
-                                                search_widget.height()):
-                search_widget.move(QPoint(*saved))
+            if saved:
+                clamped = clamp_rect_to_screens(
+                    QRect(saved[0], saved[1],
+                          search_widget.width(), search_widget.height()),
+                    current_screen_rects())
+                search_widget.move(clamped.topLeft())
+                if (clamped.x(), clamped.y()) != (saved[0], saved[1]):
+                    positions[name] = cfg.format_position(
+                        clamped.x(), clamped.y())
+                    need_save_default = True
             else:
                 search_widget.move(QPoint(screen.left() + 40,
                                           screen.top() + 40))
@@ -494,6 +513,56 @@ class AppContext:
             if inter.width() >= 80 and inter.height() >= 80:
                 return True
         return False
+
+    # ---------- 屏幕变化守卫 ----------
+
+    def _watch_screen_changes(self):
+        """监听显示器增删/分辨率变化：任何变化都把格子收回屏幕并写回配置。"""
+        app = QApplication.instance()
+        if app is None:
+            return
+        app.screenAdded.connect(self._on_screens_changed)
+        app.screenRemoved.connect(self._on_screens_changed)
+        for screen in app.screens():
+            self._hook_screen(screen)
+        app.screenAdded.connect(self._hook_screen)
+
+    def _hook_screen(self, screen):
+        """订阅单个屏幕的几何变化（分辨率、任务栏、DPI 变动都会触发）。"""
+        screen.geometryChanged.connect(self._on_screens_changed)
+        screen.availableGeometryChanged.connect(self._on_screens_changed)
+
+    def _on_screens_changed(self, *_args):
+        """屏幕变化信号可能成串到达：防抖后统一处理，避免连续重排。"""
+        self._screen_timer.start(400)
+
+    def reclamp_widgets(self) -> int:
+        """把所有格子收进屏幕可见区域（屏幕变化自动触发；托盘菜单也能手动触发）。
+
+        返回被移动的格子数量；修正后的位置会写回配置。
+        """
+        screens = current_screen_rects()
+        positions = self.config.setdefault("widgetPositions", {})
+        moved = 0
+        for widget in self.widgets:
+            rect = QRect(widget.x(), widget.y(),
+                         widget.width(), widget.height())
+            clamped = clamp_rect_to_screens(rect, screens)
+            if clamped == rect:
+                continue
+            widget.setGeometry(clamped)
+            positions[widget.grid_key] = cfg.format_position(
+                clamped.x(), clamped.y())
+            moved += 1
+        if moved:
+            cfg.save_config(self.config)
+            self.refresh_status(f"已把 {moved} 个格子移回屏幕内")
+        return moved
+
+    def request_quit(self):
+        """控制面板「退出助手」：保存几何后退出（位置由 aboutToQuit 统一保存）。"""
+        self.panel.save_geometry()
+        QApplication.instance().quit()
 
     def widget_rects(self, current: FileWidget):
         """其它可见格子的矩形列表，供拖动窗口时吸附对齐。"""
@@ -1325,6 +1394,8 @@ def main():
     act_toggle.triggered.connect(ctx.toggle_widgets)
     act_tidy = QAction("整齐排列格子", menu)
     act_tidy.triggered.connect(ctx.tidy_layout)
+    act_rescue = QAction("把所有格子移回屏幕内", menu)
+    act_rescue.triggered.connect(ctx.reclamp_widgets)
     act_game = QAction("游戏模式 (F9)", menu, checkable=True)
     act_game.triggered.connect(
         lambda checked: ctx.set_game_mode(checked))
@@ -1334,7 +1405,8 @@ def main():
         lambda checked: ctx.set_auto_organize(checked))
     act_quit = QAction("退出", menu)
     act_quit.triggered.connect(app.quit)
-    for act in (act_panel, act_organize, act_toggle, act_tidy, act_game, act_auto):
+    for act in (act_panel, act_organize, act_toggle, act_tidy, act_rescue,
+                act_game, act_auto):
         menu.addAction(act)
     menu.addSeparator()
     menu.addAction(act_quit)
@@ -1345,12 +1417,30 @@ def main():
         lambda reason: ctx.show_panel()
         if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick)
         else None)
-    tray.show()
-    ctx.tray = tray
+    if QSystemTrayIcon.isSystemTrayAvailable():
+        tray.show()
+        # 首次运行弹一次托盘提示：用户反馈"不知道程序在运行、找不到退出"，
+        # 明确告诉出口在哪（之后不再打扰，配置里记住）
+        if not ctx.config.get("trayTipShown", False):
+            tray.showMessage(
+                "桌面分类助手已在系统托盘运行",
+                "左键图标 = 控制面板；右键菜单里有「退出」。\n关闭面板不会退出程序，按 F8 可随时重新打开。",
+                QSystemTrayIcon.Information, 6000)
+            ctx.config["trayTipShown"] = True
+            cfg.save_config(ctx.config)
+        ctx.tray = tray
+    else:
+        # 托盘不可用（罕见环境）：关闭面板=退出，保证用户始终有明确的出口
+        app.setQuitOnLastWindowClosed(True)
+        ctx.tray = None
+        QMessageBox.warning(
+            None, "系统托盘不可用",
+            "当前系统没有可用的通知区域（系统托盘），程序无法常驻运行。\n\n"
+            "此时关闭控制面板将直接退出程序；请通过桌面快捷方式再次启动。")
     ctx.act_game_mode = act_game
     ctx.act_auto_organize = act_auto
 
-    if hotkeys_failed:
+    if hotkeys_failed and ctx.tray is not None:
         tray.showMessage("部分热键不可用",
                          "、".join(hotkeys_failed) + " 可能被其它程序占用，可从托盘菜单操作。",
                          QSystemTrayIcon.Warning, 3000)
