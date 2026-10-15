@@ -1,7 +1,7 @@
 {
-  "version": "2.10.0",
-  "url": "https://github.com/jokerXYH/desktop-organizer/releases/download/v2.10.0/desktop-organizer_v2.10.0.exe",
-  "sha256": "5d345f0fd8bf06a5bbeaad46099b6c024547b3e5fcea6084069d9f51d64df790",
+  "version": "2.11.0",
+  "url": "https://github.com/jokerXYH/desktop-organizer/releases/download/v2.11.0/desktop-organizer_v2.11.0.exe",
+  "sha256": "ea70fd58f6a938383721715765b93ae39367197c7f753c385d7c7de51b65fbdd",
   "page": "https://github.com/jokerXYH/desktop-organizer/releases/latest",
-  "notes": "横向三栏控制面板；一键更新；桌面右键一键整理；整齐排列 / 收起格子。"
+  "notes": "修复格子跑出屏幕：拖动/缩放加边界钳制，显示器变化自动收回，托盘新增「把所有格子移回屏幕内」；新增面板「退出助手」红色按钮（关窗≠退出），首次运行有托盘提示指引退出入口；面板加入顶栏与底栏操作区。"
 }
