@@ -6,10 +6,11 @@ import sys
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
-from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtCore import QRect, Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 import config as cfg  # noqa: E402
+import layout_store  # noqa: E402
 import organizer as org  # noqa: E402
 import shell_menu  # noqa: E402
 from main import AppContext  # noqa: E402
@@ -48,6 +49,14 @@ def test_rebuild_creates_category_widgets(ctx):
     assert len(ctx.widgets) == expected
     for name in ctx.config["categories"]:
         assert os.path.isdir(os.path.join(ctx.config["storageRoot"], name))
+
+
+def test_tray_icon_renders():
+    """托盘图标必须在无资源文件时也能成功绘制（防止漏导入画笔类）。"""
+    from main import make_tray_icon
+
+    icon = make_tray_icon()
+    assert not icon.isNull()
 
 
 def test_handle_drop_moves_file_and_records_history(ctx):
@@ -1080,6 +1089,17 @@ def test_panel_has_exit_entry(ctx):
     assert "关于" in ctx.panel.about_btn.text()
 
 
+def test_panel_has_left_navigation_and_pages(ctx):
+    """控制面板改为左侧导航 + 右侧分页，四个页面都能切换到。"""
+    assert len(ctx.panel.nav_buttons) == 4
+    assert ctx.panel.pages.count() == 4
+
+    ctx.panel._switch_page(1)
+
+    assert ctx.panel.pages.currentIndex() == 1
+    assert "格子" in ctx.panel.page_title_label.text()
+
+
 def test_reclamp_brings_widgets_back_into_screen(ctx):
     """换屏/分辨率变化后：reclamp 把越界格子收回屏内并把修正写回配置。"""
     from PySide6.QtCore import QRect
@@ -1112,3 +1132,117 @@ def test_offscreen_saved_position_clamped_on_restart(ctx):
     rect = QRect(doc.x(), doc.y(), doc.width(), doc.height())
     assert screen.intersected(rect) == rect
     assert cfg.load_config()["widgetPositions"].get("文档") != "281,99999"
+
+
+# ---------- 显示器感知的布局记忆 ----------
+
+class _FakeScreen:
+    """布局集成测试用屏幕替身。"""
+
+    def __init__(self, name: str, rect):
+        self._name = name
+        self._rect = QRect(rect)
+
+    def name(self):
+        return self._name
+
+    def geometry(self):
+        return QRect(self._rect)
+
+    def availableGeometry(self):
+        return QRect(self._rect)
+
+
+def test_missing_screen_layout_is_not_overwritten_on_restart(ctx):
+    """副屏未就绪：格子临时可见，但 widgetLayouts 的原始坐标必须保留。"""
+    secondary = _FakeScreen(r"\\.\DISPLAY9", QRect(-1920, 0, 1920, 1040))
+    saved_rect = QRect(-1745, 55, 330, 485)
+    ctx.config.setdefault("widgetLayouts", {})["文档"] = \
+        layout_store.make_layout_record(saved_rect, secondary)
+    ctx.config.setdefault("widgetPositions", {})["文档"] = "-1745,55"
+    cfg.save_config(ctx.config)
+
+    ctx.rebuild_widgets()
+
+    doc = next(w for w in ctx.widgets if w.title == "文档")
+    assert doc._layout_provisional is True
+    assert doc.x() >= 0                      # 临时落在当前可见屏幕
+    stored = cfg.load_config()["widgetLayouts"]["文档"]
+    assert (stored["x"], stored["y"]) == (-1745, 55)
+    assert cfg.load_config()["widgetPositions"]["文档"] == "-1745,55"
+
+
+def test_provisional_widget_returns_home_when_screen_appears(ctx):
+    """副屏出现后，临时安置的格子自动回到保存坐标。"""
+    secondary = _FakeScreen(r"\\.\DISPLAY9", QRect(-1920, 0, 1920, 1040))
+    saved_rect = QRect(-1745, 55, 330, 485)
+    ctx.config.setdefault("widgetLayouts", {})["文档"] = \
+        layout_store.make_layout_record(saved_rect, secondary)
+    ctx.config.setdefault("widgetPositions", {})["文档"] = "-1745,55"
+    cfg.save_config(ctx.config)
+    ctx.rebuild_widgets()
+
+    ctx._restore_provisional_widgets([secondary])
+
+    doc = next(w for w in ctx.widgets if w.title == "文档")
+    assert doc.geometry() == saved_rect
+    assert doc._layout_provisional is False
+
+
+def test_monitor_disappearing_keeps_saved_layout(ctx):
+    """运行中拔掉副屏：格子变临时状态，reclamp 不能覆盖原副屏坐标。"""
+    secondary = _FakeScreen(r"\\.\DISPLAY8", QRect(-1920, 0, 1920, 1040))
+    saved_rect = QRect(-1745, 80, 330, 485)
+    ctx.config.setdefault("widgetLayouts", {})["文档"] = \
+        layout_store.make_layout_record(saved_rect, secondary)
+    cfg.save_config(ctx.config)
+    doc = next(w for w in ctx.widgets if w.title == "文档")
+    doc._layout_provisional = False
+
+    ctx.reclamp_widgets()
+
+    assert doc._layout_provisional is True
+    stored = cfg.load_config()["widgetLayouts"]["文档"]
+    assert (stored["x"], stored["y"]) == (-1745, 80)
+
+
+def test_restore_resolves_exact_duplicate_positions(ctx):
+    """两条布局记录完全重叠时，启动后自动错开。"""
+    screen = QApplication.primaryScreen()
+    area = screen.availableGeometry()
+    rect = QRect(area.x() + 40, area.y() + 40, 240, 320)
+    layouts = ctx.config.setdefault("widgetLayouts", {})
+    layouts["文档"] = layout_store.make_layout_record(rect, screen)
+    layouts["图片"] = layout_store.make_layout_record(rect, screen)
+    positions = ctx.config.setdefault("widgetPositions", {})
+    positions["文档"] = f"{rect.x()},{rect.y()}"
+    positions["图片"] = f"{rect.x()},{rect.y()}"
+    cfg.save_config(ctx.config)
+
+    ctx.rebuild_widgets()
+
+    doc = next(w for w in ctx.widgets if w.title == "文档")
+    pics = next(w for w in ctx.widgets if w.title == "图片")
+    assert not doc.geometry().intersects(pics.geometry())
+
+
+def test_resize_updates_layout_record(ctx):
+    """拖拽改尺寸后，新的显示器感知记录同步更新。"""
+    doc = next(w for w in ctx.widgets if w.title == "文档")
+    doc._apply_window_size(420, 300)
+    doc._emit_size()
+
+    stored = cfg.load_config()["widgetLayouts"]["文档"]
+    assert (stored["w"], stored["h"]) == (420, 300)
+
+
+def test_legacy_positions_are_migrated_to_screen_aware_layouts(ctx):
+    """旧配置首次启动时自动补写显示器身份，不必等用户拖动一次。"""
+    ctx.config["widgetLayouts"] = {}
+    cfg.save_config(ctx.config)
+
+    ctx.rebuild_widgets()
+
+    stored = cfg.load_config()["widgetLayouts"]
+    assert "文档" in stored
+    assert stored["文档"]["screen"]

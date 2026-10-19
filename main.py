@@ -17,18 +17,20 @@ from ctypes import wintypes
 from datetime import datetime
 
 from PySide6.QtCore import (QAbstractNativeEventFilter, QFileSystemWatcher,
-                            QPoint, QRect, Qt, QTimer)
-from PySide6.QtGui import (QAction, QColor, QFont, QIcon, QLinearGradient,
-                           QPainter, QPixmap)
+                            QRect, Qt, QTimer)
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (QApplication, QFileDialog, QInputDialog,
                                QMenu, QMessageBox, QSystemTrayIcon)
 
 import autostart
 import config as cfg
+import instance_guard
+import layout_store
 import organizer as org
 import shell_menu
 import shortcut
+import theme
 import updater
 from control_panel import ControlPanel
 from search_service import SearchService
@@ -62,32 +64,8 @@ AUTO_DIR_SCAN_CAP = 500        # 文件夹稳定性快照的递归条目数上�
 # 单实例互斥：本地套接字服务名（Windows 上对应命名管道）
 SINGLE_INSTANCE_KEY = "MyDeskOrganizer.SingleInstance"
 
-# 全局玻璃拟态 QSS：右键菜单、工具提示与弹窗对话框跟随应用的暗色玻璃主题
-APP_QSS = """
-QMenu{background:#1c1f26;color:#eceef1;border:1px solid rgba(255,255,255,38);
-      border-radius:10px;padding:6px;}
-QMenu::item{padding:6px 20px;border-radius:7px;}
-QMenu::item:selected{background:rgba(255,255,255,60);color:#ffffff;}
-QMenu::separator{height:1px;background:rgba(255,255,255,26);margin:5px 8px;}
-QToolTip{background:#1c1f26;color:#eceef1;border:1px solid rgba(255,255,255,38);
-         border-radius:8px;padding:5px 8px;}
-QDialog,QMessageBox,QInputDialog{background:#17181b;color:#eceef1;}
-QDialog QLabel,QMessageBox QLabel,QInputDialog QLabel{
-      color:#eceef1;background:transparent;}
-QDialog QPushButton,QMessageBox QPushButton{background:rgba(255,255,255,14);
-      border:1px solid rgba(255,255,255,30);border-radius:9px;
-      padding:6px 18px;color:#eceef1;}
-QDialog QPushButton:hover,QMessageBox QPushButton:hover{
-      background:rgba(255,255,255,26);border-color:rgba(255,255,255,150);}
-QDialog QPushButton:pressed{background:rgba(255,255,255,8);}
-QDialog QLineEdit,QInputDialog QLineEdit{background:rgba(255,255,255,10);
-      border:1px solid rgba(255,255,255,28);border-radius:9px;
-      padding:6px 10px;color:#eceef1;
-      selection-background-color:rgba(255,255,255,70);}
-QDialog QLineEdit:focus{border-color:rgba(255,255,255,150);}
-QTextBrowser{background:rgba(0,0,0,70);border:1px solid rgba(255,255,255,26);
-      border-radius:10px;padding:8px;color:#eceef1;}
-"""
+# 全局菜单/弹窗跟随瓷白主题；格子与面板有各自的专用 QSS。
+APP_QSS = theme.DIALOG_QSS
 
 
 def _norm_dir(path) -> str:
@@ -150,24 +128,20 @@ def update_wait_pid(argv):
 
 
 def make_tray_icon() -> QIcon:
-    """程序托盘图标：程序化绘制一个玻璃感圆角方块，避免依赖外部资源文件。"""
+    """程序托盘图标：墨色圆角方块 + 深青描边，避免依赖外部资源文件。"""
     pixmap = QPixmap(64, 64)
     pixmap.fill(QColor(0, 0, 0, 0))
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.Antialiasing)
-    # 主体：上下渐变（上亮下深），比纯色块更有体积感
-    gradient = QLinearGradient(0, 4, 0, 60)
-    gradient.setColorAt(0.0, QColor(108, 214, 255))
-    gradient.setColorAt(1.0, QColor(48, 150, 214))
-    painter.setBrush(gradient)
+    painter.setBrush(QColor(theme.PALETTE["rail"]))
     painter.setPen(QColor(0, 0, 0, 0))
-    painter.drawRoundedRect(4, 4, 56, 56, 16, 16)      # 圆角底
+    painter.drawRoundedRect(4, 4, 56, 56, 16, 16)
     painter.setBrush(Qt.NoBrush)
-    painter.setPen(QColor(255, 255, 255, 90))          # 内高光描边：玻璃边缘反光
-    painter.drawRoundedRect(5, 5, 54, 54, 15, 15)
-    painter.setPen(QColor(255, 255, 255))
-    painter.setFont(QFont("Microsoft YaHei UI", 26, QFont.Bold))
-    painter.drawText(pixmap.rect(), 132, "分")       # 132 = 水平垂直居中
+    painter.setPen(QPen(QColor(theme.PALETTE["jade"]), 2))
+    painter.drawRoundedRect(7, 7, 50, 50, 13, 13)
+    painter.setPen(QColor(theme.PALETTE["rail_text"]))
+    painter.setFont(QFont(theme.FONT_FAMILY, 26, QFont.DemiBold))
+    painter.drawText(pixmap.rect(), 132, "分")
     painter.end()
     return QIcon(pixmap)
 
@@ -229,6 +203,11 @@ class AppContext:
         self._screen_timer = QTimer()
         self._screen_timer.setSingleShot(True)
         self._screen_timer.timeout.connect(self.reclamp_widgets)
+        # 登录后显示器枚举可能比 Explorer 晚 1–3 秒；再补一次延迟恢复，
+        # 让副屏上的格子在系统稳定后自动回位。
+        self._screen_settle_timer = QTimer()
+        self._screen_settle_timer.setSingleShot(True)
+        self._screen_settle_timer.timeout.connect(self._delayed_layout_restore)
         self._watch_screen_changes()
 
     # ---------- 格子管理 ----------
@@ -252,7 +231,11 @@ class AppContext:
             os.makedirs(os.path.join(root, name), exist_ok=True)
 
     def rebuild_widgets(self):
-        """按当前配置重建全部桌面格子；有记忆位置则恢复（越界自动钳回屏内），否则平铺摆放。"""
+        """按当前配置重建全部桌面格子。
+
+        布局恢复优先使用显示器感知的 widgetLayouts：副屏暂未就绪时先临时
+        放在当前可见屏幕，但保留目标坐标，绝不把临时位置写回配置。
+        """
         for w in self.widgets:
             w.close()
         self.widgets.clear()
@@ -260,8 +243,10 @@ class AppContext:
 
         root = self.config["storageRoot"]
         screen = QApplication.primaryScreen().availableGeometry()
-        positions = self.config.get("widgetPositions", {})
-        sizes = self.config.get("widgetSizes", {})
+        screens = QApplication.screens()
+        positions = self.config.setdefault("widgetPositions", {})
+        layouts = self.config.setdefault("widgetLayouts", {})
+        sizes = self.config.setdefault("widgetSizes", {})
         scales = self.config.get("widgetScales", {})
         previews = self.config.get("widgetPreviews", {})
         mapped = self.config.get("gridPaths", {})
@@ -269,7 +254,25 @@ class AppContext:
         collapsed_map = self.config.get("widgetCollapsed", {})
         need_save_default = False         # 是否有格子的位置需要写回配置
         placed_rects: list = []           # 已落位格子的矩形：新格子据此避开重叠
-        pending: list = []                # 没有有效记忆位置的格子：统一排队落位
+        pending: list = []                # 没有有效记忆位置/副屏未就绪的格子
+        restored: list = []               # 已按真实屏幕恢复的格子：检查重叠
+
+        def apply_resolution(widget, resolution):
+            """把恢复方案应用到窗口；返回是否需要保存布局。"""
+            widget._layout_desired_rect = QRect(resolution.desired)
+            widget._layout_provisional = bool(resolution.provisional)
+            if resolution.rect is None:
+                pending.append(widget)
+                return False
+            target = QRect(resolution.rect.x(), resolution.rect.y(),
+                           widget.width(), widget.height())
+            target = clamp_rect_to_screens(target, current_screen_rects())
+            widget.setGeometry(target)
+            placed_rects.append(target)
+            if not resolution.provisional:
+                restored.append(widget)
+            return bool(resolution.changed) and not resolution.provisional
+
         for name in self.config.get("categories", []):
             folder = mapped.get(name) or os.path.join(root, name)
             display = titles.get(name, name)   # 内置分类改名后：键不变，只换显示名
@@ -289,7 +292,7 @@ class AppContext:
                 on_delete_grid=self.handle_delete_grid_request,
                 on_new_grid=self.handle_new_grid_request,
                 on_map_folder=self.handle_map_folder_request,
-                size=cfg.parse_position(sizes.get(name, "")),
+                size=self._stored_widget_size(name, sizes, layouts),
                 metrics_scale=metrics,
                 on_zoom_changed=self.handle_zoom_changed,
                 on_size_changed=self.handle_size_changed,
@@ -303,34 +306,16 @@ class AppContext:
                 on_tidy_layout=self.tidy_layout,
                 on_organize_desktop=self.organize_now,
                 grid_key=name)
-            saved = cfg.parse_position(positions.get(name, ""))
-            if saved:
-                # 恢复上次拖动后的位置；越界（换屏/分辨率变化）一律钳回屏幕内，
-                # 并把修正后的坐标写回配置——格子永远不会"藏在屏幕外面"
-                clamped = clamp_rect_to_screens(
-                    QRect(saved[0], saved[1], widget.width(), widget.height()),
-                    current_screen_rects())
-                widget.move(clamped.topLeft())
-                placed_rects.append(clamped)
-                if (clamped.x(), clamped.y()) != (saved[0], saved[1]):
-                    positions[name] = cfg.format_position(
-                        clamped.x(), clamped.y())
-                    need_save_default = True
-            else:
+            resolution = self._resolve_saved_geometry(widget, name, positions)
+            if resolution is None:
                 pending.append(widget)
                 need_save_default = True
-            widget.show()
+            else:
+                need_save_default = apply_resolution(
+                    widget, resolution) or need_save_default
+            if name not in layouts:
+                need_save_default = True     # 旧配置首次启动：立即补写屏幕感知记录
             self.widgets.append(widget)
-
-        # 无记忆位置的格子统一排队落位：贴右侧列下方，放不下就在整块左侧开新列
-        for widget in pending:
-            anchored = [rect for rect in placed_rects
-                        if screen.intersects(rect)]
-            point = plan_default_placement(
-                anchored, (widget.width(), widget.height()), screen)
-            widget.move(point)
-            placed_rects.append(QRect(point.x(), point.y(),
-                                      widget.width(), widget.height()))
 
         # 桌面搜索条：扁平形态（只有搜索框高度）、常驻桌面、可删除；位置记忆键名固定为"搜索"
         if self.config.get("searchGrid", False):
@@ -351,28 +336,97 @@ class AppContext:
                 guide_hide=self.hide_guides,
                 on_tidy_layout=self.tidy_layout,
                 on_organize_desktop=self.organize_now)
-            saved = cfg.parse_position(positions.get(name, ""))
-            if saved:
-                clamped = clamp_rect_to_screens(
-                    QRect(saved[0], saved[1],
-                          search_widget.width(), search_widget.height()),
-                    current_screen_rects())
-                search_widget.move(clamped.topLeft())
-                if (clamped.x(), clamped.y()) != (saved[0], saved[1]):
-                    positions[name] = cfg.format_position(
-                        clamped.x(), clamped.y())
-                    need_save_default = True
-            else:
-                search_widget.move(QPoint(screen.left() + 40,
-                                          screen.top() + 40))
+            resolution = self._resolve_saved_geometry(
+                search_widget, name, positions)
+            if resolution is None:
+                pending.append(search_widget)
                 need_save_default = True
-            search_widget.show()
+            else:
+                need_save_default = apply_resolution(
+                    search_widget, resolution) or need_save_default
+            if name not in layouts:
+                need_save_default = True
             self.widgets.append(search_widget)
+
+        # 修复历史数据里的明显重叠：只处理超过较小窗口 40% 的重叠。
+        if len(restored) > 1:
+            rects = [QRect(w.x(), w.y(), w.width(), w.height())
+                     for w in restored]
+            resolved = layout_store.resolve_overlaps(
+                rects, screens, gap=WIDGET_GAP)
+            for widget, rect in zip(restored, resolved):
+                if rect == widget.geometry():
+                    continue
+                widget.setGeometry(rect)
+                need_save_default = True
+
+        # 无记忆位置或副屏未就绪的格子：统一在主屏排队落位，避开已恢复的格子。
+        for widget in pending:
+            anchored = [rect for rect in placed_rects
+                        if screen.intersects(rect)]
+            point = plan_default_placement(
+                anchored, (widget.width(), widget.height()), screen)
+            widget.move(point)
+            placed_rects.append(QRect(point.x(), point.y(),
+                                      widget.width(), widget.height()))
+            if not widget._layout_provisional:
+                need_save_default = True
+
+        for widget in self.widgets:
+            widget.show()
 
         if need_save_default:
             self.save_all_positions()
         self._apply_visibility()
         self._sync_watcher_paths()
+
+    def _stored_widget_size(self, key, sizes, layouts):
+        """窗口尺寸优先用 widgetSizes；只有新布局记录时回退到其中的 w/h。"""
+        parsed = cfg.parse_position(sizes.get(key, ""))
+        if parsed:
+            return parsed
+        record = layouts.get(key)
+        if isinstance(record, dict):
+            try:
+                return int(record["w"]), int(record["h"])
+            except (KeyError, TypeError, ValueError):
+                return None
+        return None
+
+    def _resolve_saved_geometry(self, widget, key, positions):
+        """读取新布局记录；旧配置则用 widgetPositions 构造兼容记录。"""
+        record = self.config.get("widgetLayouts", {}).get(key)
+        if layout_store.record_rect(record) is None:
+            saved = cfg.parse_position(positions.get(key, ""))
+            if not saved:
+                return None
+            record = {
+                "x": saved[0],
+                "y": saved[1],
+                "w": widget.width(),
+                "h": widget.height(),
+            }
+        return layout_store.restore_layout(record, QApplication.screens())
+
+    @staticmethod
+    def _widget_screen(widget):
+        """窗口中心所在屏幕；极端情况下回退主屏。"""
+        return (QApplication.screenAt(widget.geometry().center())
+                or QApplication.primaryScreen())
+
+    def _save_widget_layout(self, widget, positions=None) -> bool:
+        """保存格子当前的显示器感知布局；临时布局不写回。"""
+        if getattr(widget, "_layout_provisional", False):
+            return False
+        screen = self._widget_screen(widget)
+        layouts = self.config.setdefault("widgetLayouts", {})
+        layouts[widget.grid_key] = layout_store.make_layout_record(
+            widget.geometry(), screen)
+        widget._layout_desired_rect = QRect(widget.geometry())
+        if positions is not None:
+            positions[widget.grid_key] = cfg.format_position(
+                widget.x(), widget.y())
+        return True
 
     def refresh_all(self):
         """刷新所有格子的文件列表。"""
@@ -440,8 +494,8 @@ class AppContext:
         for widget in self.widgets:
             if not widget.isVisible():
                 continue
-            positions[widget.grid_key] = cfg.format_position(
-                widget.x(), widget.y())
+            widget._layout_provisional = False
+            self._save_widget_layout(widget, positions)
             if not getattr(widget, "_collapsed", False):
                 sizes[widget.grid_key] = cfg.format_position(
                     widget.width(), widget.height())
@@ -491,15 +545,20 @@ class AppContext:
 
     def handle_position_changed(self, widget: FileWidget):
         """格子拖动停止（防抖后）：把新位置写入配置并持久化。"""
+        widget._layout_provisional = False
         positions = self.config.setdefault("widgetPositions", {})
-        positions[widget.grid_key] = cfg.format_position(widget.x(), widget.y())
+        self._save_widget_layout(widget, positions)
         cfg.save_config(self.config)
 
     def save_all_positions(self):
-        """退出或首次布局时保存全部格子位置。"""
+        """退出或首次布局时保存全部格子位置。
+
+        副屏暂时缺失的格子处于 provisional 状态：保留原目标坐标，跳过写入，
+        避免一次开机把副屏位置永久覆盖成主屏位置。
+        """
         positions = self.config.setdefault("widgetPositions", {})
         for w in self.widgets:
-            positions[w.grid_key] = cfg.format_position(w.x(), w.y())
+            self._save_widget_layout(w, positions)
         self.config["panelGeometry"] = cfg.format_geometry(
             self.panel.x(), self.panel.y(),
             self.panel.width(), self.panel.height())
@@ -535,24 +594,75 @@ class AppContext:
     def _on_screens_changed(self, *_args):
         """屏幕变化信号可能成串到达：防抖后统一处理，避免连续重排。"""
         self._screen_timer.start(400)
+        self._screen_settle_timer.start(2500)
+
+    def _delayed_layout_restore(self):
+        """登录后显示器枚举较慢时补一次恢复，副屏出现后把格子送回原位。"""
+        restored = self._restore_provisional_widgets()
+        self.reclamp_widgets()
+        if restored:
+            self.refresh_status(f"副屏已就绪，{restored} 个格子已回到保存位置")
+
+    def _restore_provisional_widgets(self, screens=None) -> int:
+        """副屏出现后回放 provisional 格子；返回真正回到保存位置的格子数。"""
+        screens = list(screens or QApplication.screens())
+        layouts = self.config.setdefault("widgetLayouts", {})
+        positions = self.config.setdefault("widgetPositions", {})
+        restored = 0
+        for widget in self.widgets:
+            if not getattr(widget, "_layout_provisional", False):
+                continue
+            resolution = layout_store.restore_layout(
+                layouts.get(widget.grid_key), screens)
+            if (resolution is None or resolution.provisional
+                    or resolution.rect is None):
+                continue
+            target = QRect(resolution.rect.x(), resolution.rect.y(),
+                           widget.width(), widget.height())
+            target = clamp_rect_to_screens(
+                target, [screen.availableGeometry() for screen in screens])
+            widget.setGeometry(target)
+            widget._layout_provisional = False
+            widget._layout_desired_rect = QRect(resolution.desired)
+            self._save_widget_layout(widget, positions)
+            restored += 1
+        if restored:
+            cfg.save_config(self.config)
+        return restored
 
     def reclamp_widgets(self) -> int:
         """把所有格子收进屏幕可见区域（屏幕变化自动触发；托盘菜单也能手动触发）。
 
         返回被移动的格子数量；修正后的位置会写回配置。
         """
-        screens = current_screen_rects()
+        screens = list(QApplication.screens())
+        self._restore_provisional_widgets(screens)
+        screen_rects = [screen.availableGeometry() for screen in screens]
         positions = self.config.setdefault("widgetPositions", {})
+        layouts = self.config.setdefault("widgetLayouts", {})
         moved = 0
         for widget in self.widgets:
+            if getattr(widget, "_layout_provisional", False):
+                continue
             rect = QRect(widget.x(), widget.y(),
                          widget.width(), widget.height())
-            clamped = clamp_rect_to_screens(rect, screens)
-            if clamped == rect:
+            resolution = layout_store.restore_layout(
+                layouts.get(widget.grid_key), screens)
+            if resolution is not None and resolution.provisional:
+                # 目标屏暂时缺失：保留当前位置与目标坐标，等屏幕回来再回放。
+                widget._layout_provisional = True
+                widget._layout_desired_rect = QRect(resolution.desired)
                 continue
-            widget.setGeometry(clamped)
-            positions[widget.grid_key] = cfg.format_position(
-                clamped.x(), clamped.y())
+            if resolution is not None and resolution.rect is not None:
+                target = QRect(resolution.rect.x(), resolution.rect.y(),
+                               widget.width(), widget.height())
+                target = clamp_rect_to_screens(target, screen_rects)
+            else:
+                target = clamp_rect_to_screens(rect, screen_rects)
+            if target == rect:
+                continue
+            widget.setGeometry(target)
+            self._save_widget_layout(widget, positions)
             moved += 1
         if moved:
             cfg.save_config(self.config)
@@ -595,6 +705,8 @@ class AppContext:
         sizes = self.config.setdefault("widgetSizes", {})
         sizes[widget.grid_key] = cfg.format_position(widget.width(),
                                                      widget.height())
+        positions = self.config.setdefault("widgetPositions", {})
+        self._save_widget_layout(widget, positions)
         cfg.save_config(self.config)
         self.refresh_status(
             f"「{widget.title}」窗口大小已调整为 {widget.width()}×{widget.height()}")
@@ -762,6 +874,9 @@ class AppContext:
         positions = self.config.get("widgetPositions", {})
         if old_name in positions:
             positions[new_name] = positions.pop(old_name)
+        layouts = self.config.get("widgetLayouts", {})
+        if old_name in layouts:
+            layouts[new_name] = layouts.pop(old_name)
         sizes = self.config.get("widgetSizes", {})
         if old_name in sizes:
             sizes[new_name] = sizes.pop(old_name)
@@ -786,6 +901,7 @@ class AppContext:
         if name in categories:
             categories.remove(name)
         self.config.get("widgetPositions", {}).pop(name, None)
+        self.config.get("widgetLayouts", {}).pop(name, None)
         self.config.get("widgetSizes", {}).pop(name, None)
         self.config.get("widgetScales", {}).pop(name, None)
         self.config.get("widgetPreviews", {}).pop(name, None)
@@ -854,7 +970,8 @@ class AppContext:
 
     def set_autostart(self, enabled: bool):
         """写入/删除注册表自启项并记录到配置。"""
-        autostart.set_autostart(SCRIPT_PATH, enabled)
+        autostart.set_autostart(
+            SCRIPT_PATH, enabled, extra_args=[autostart.AUTOSTART_ARG])
         self.config["autostart"] = enabled
         cfg.save_config(self.config)
 
@@ -1309,13 +1426,23 @@ def main():
     app.setApplicationName("桌面分类助手")
     app.setStyleSheet(APP_QSS)
 
-    # 单实例：已有实例在运行时，把本次意图转交后本进程直接退出
-    # （b"organize" 来自桌面右键菜单「一键整理桌面」；默认是唤起控制面板）
     action = cli_action(sys.argv)
-    if notify_running_instance(
-            b"organize" if action == "organize" else b"show"):
+
+    # 先抢进程锁，再创建任何窗口：登录时两个启动项同时拉起也不会各建一套格子。
+    instance_lock = instance_guard.acquire(
+        os.path.join(cfg.CONFIG_DIR, "app.lock"))
+    if instance_lock is None:
+        notify_running_instance(
+            b"organize" if action == "organize" else b"show")
         return
 
+    # 已开启自启时自动修正过期路径，并补上 --autostart 参数。
+    try:
+        autostart.sync_autostart(SCRIPT_PATH)
+    except OSError:
+        pass
+
+    is_autostart = autostart.AUTOSTART_ARG in sys.argv
     ctx = AppContext()
 
     # 单实例服务：接收后续启动实例的"唤起"请求
@@ -1445,19 +1572,32 @@ def main():
                          "、".join(hotkeys_failed) + " 可能被其它程序占用，可从托盘菜单操作。",
                          QSystemTrayIcon.Warning, 3000)
 
-    # 构建格子（自动恢复上次位置）；若上次处于游戏模式则保持隐藏
-    ctx.rebuild_widgets()
-    if ctx.config.get("gameMode", False):
-        ctx.set_game_mode(True, notify=False)   # 启动恢复不重复弹提示
+    def _start_widgets():
+        """构建格子并恢复状态；自启模式下不主动弹控制面板。"""
+        ctx.rebuild_widgets()
+        if ctx.config.get("gameMode", False):
+            ctx.set_game_mode(True, notify=False)   # 启动恢复不重复弹提示
+        elif not is_autostart:
+            ctx.show_panel()
+        if ctx.config.get("autoOrganize", False) and not ctx._game_mode:
+            ctx.set_auto_organize(True)             # 重新建立桌面基线
+        if action == "organize":                    # 桌面右键菜单启动：进入后即整理
+            QTimer.singleShot(120, ctx.organize_now)
+
+    # Win10 登录后显示器枚举可能晚于 Run 项：自启时稍等桌面就绪，
+    # 避免副屏尚未出现就把格子临时落在主屏。
+    if is_autostart:
+        QTimer.singleShot(1200, _start_widgets)
     else:
-        ctx.show_panel()
-    if ctx.config.get("autoOrganize", False) and not ctx._game_mode:
-        ctx.set_auto_organize(True)             # 恢复自动整理（重新建立桌面基线）
-    if action == "organize":                    # 桌面右键菜单启动：进入后即执行整理
-        QTimer.singleShot(120, ctx.organize_now)
+        _start_widgets()
 
     app.aboutToQuit.connect(ctx.save_all_positions)
+    # Windows 注销/关机时先保存一次布局（不是所有关机都会走 aboutToQuit）。
+    commit_signal = getattr(app, "commitDataRequest", None)
+    if commit_signal is not None:
+        commit_signal.connect(lambda _manager: ctx.save_all_positions())
     exit_code = app.exec()
+    instance_lock.unlock()
     for hk_id in hotkeys_ok:
         ctypes.windll.user32.UnregisterHotKey(None, hk_id)
     sys.exit(exit_code)

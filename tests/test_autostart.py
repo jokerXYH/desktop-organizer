@@ -45,3 +45,25 @@ def test_build_command_frozen_exe_without_script():
     """
     cmd = autostart.build_autostart_command(r"D:\App\桌面分类助手.exe")
     assert cmd == r'"D:\App\桌面分类助手.exe"'
+
+
+def test_build_command_adds_autostart_flag(tmp_path):
+    """Win10 自启项带 --autostart：主程序据此延迟恢复布局且不弹面板。"""
+    cmd = autostart.build_autostart_command(
+        str(tmp_path / "pythonw.exe"), str(tmp_path / "main.py"),
+        extra_args=[autostart.AUTOSTART_ARG])
+    assert cmd.endswith(
+        f'"{tmp_path / "main.py"}" {autostart.AUTOSTART_ARG}')
+
+
+def test_command_matches_ignores_case_and_spacing():
+    """旧注册表命令可能大小写/空白不同，应视为同一条命令。"""
+    expected = r'"D:\App\桌面分类助手.exe" --autostart'
+    assert autostart.command_matches(
+        '  "d:\\app\\桌面分类助手.exe"   --autostart  ', expected)
+
+
+def test_command_matches_detects_stale_path():
+    expected = r'"F:\新目录\main.py" --autostart'
+    assert not autostart.command_matches(
+        r'"E:\旧目录\main.py" --autostart', expected)

@@ -51,6 +51,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "previewIcons": True,                          # 格子预览：True=图标视图 False=紧凑列表
     "gameMode": False,                             # 游戏模式：隐藏格子并暂停监听
     "widgetPositions": {},                         # 格子位置记忆：{分类名: "x,y"}
+    "widgetLayouts": {},                           # 显示器感知布局：{分类键: {x,y,w,h,screen,screenRect}}
     "widgetSizes": {},                             # 格子窗口尺寸：{分类名: "宽,高"}（拖拽调整）
     "widgetScales": {},                            # 图标/列宽缩放：{分类名: 缩放比}
     "widgetPreviews": {},                          # 单格子预览方式：{分类名: True=图标视图}

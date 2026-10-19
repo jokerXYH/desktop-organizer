@@ -177,6 +177,8 @@ def main():
     search_widget._run_search()
 
     panel = prepare(ControlPanel(_StubContext(storage)))
+    # 截图面板使用演示配置：关闭时绝不能把演示路径写进真实 settings.json。
+    panel.save_geometry = lambda: None
 
     # ---- hero.png：总览 ----
     canvas = make_background(1920, 1080)

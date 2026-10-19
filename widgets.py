@@ -29,13 +29,13 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication,
 
 from organizer import (CATEGORY_RULES, FOLDER_CATEGORY, move_to_recycle_bin,
                        rename_entry)
+import theme
 
 # 格子外观常量
 WIDGET_WIDTH = 270        # 格子宽度（像素）
 WIDGET_HEIGHT = 360       # 格子高度（像素）
-BG_ALPHA = 208            # 玻璃主背景不透明度（比纯暗色更透，透出壁纸形成毛玻璃观感）
-CORNER_RADIUS = 12        # 圆角半径（收敛一些，避免大圆角带来的"气泡感"）
-TITLE_BAR_HEIGHT = 36     # 标题栏高度
+CORNER_RADIUS = 16        # 圆角半径
+TITLE_BAR_HEIGHT = 42     # 标题栏高度
 COLLAPSED_HEIGHT = TITLE_BAR_HEIGHT + 8   # 收起形态总高度：只剩标题行 + 上下边距
 ICON_SIZE = 38            # 图标模式下文件图标的边长（像素）
 GRID_CELL_W = 76          # 图标模式网格单元宽（保证每行 3 列排满）
@@ -86,43 +86,20 @@ THUMB_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
 THUMB_MAX_SRC_BYTES = 40 * 1024 * 1024   # 超大图不缩略（PNG 需全量解码，避免卡顿）
 THUMB_CACHE_MAX = 500                    # 缩略图缓存上限，超出后淘汰最早的一半
 
-# 玻璃拟态主题色：中性暗色底 + 单层浅描边（"深底 + 细边"，去掉霓虹蓝与发光）
-COLOR_BG = QColor(31, 31, 35, BG_ALPHA)             # 玻璃主背景（渐变亮端，在上方）
-COLOR_BG_BOTTOM = QColor(22, 22, 25, BG_ALPHA)      # 玻璃主背景（渐变暗端，在下方）
-COLOR_GLOW = QColor(255, 255, 255, 16)              # 顶部高光渐变的起始色（弱化，只留一点玻璃反光）
-COLOR_BORDER = QColor(255, 255, 255, 30)            # 外描边：中性浅灰细线
-COLOR_INNER_HIGHLIGHT = QColor(255, 255, 255, 12)   # 内描边：更淡的一圈，做出玻璃"厚度"而不刺眼
-COLOR_SEPARATOR = QColor(255, 255, 255, 22)         # 标题分隔线（左右渐隐，比实线更精致）
-COLOR_TEXT = "#eceef1"                              # 主文字
-COLOR_TEXT_DIM = "#9ba1ab"                          # 次级文字（条目计数、状态提示）
-COLOR_TEXT_FAINT = "#6f747d"                        # 弱提示文字（空状态引导）
-COLOR_ACCENT = "#93a1b3"                            # 强调色（低饱和钢灰，替代原霓虹蓝）
+# 瓷白纸感主题：颜色与控件样式集中在 theme.py，格子/面板/对话框共用。
+COLOR_BG = theme.GRID_BG_TOP
+COLOR_BG_BOTTOM = theme.GRID_BG_BOTTOM
+COLOR_BORDER = theme.GRID_BORDER
+COLOR_INNER_HIGHLIGHT = theme.GRID_INNER
+COLOR_SEPARATOR = theme.GRID_SEPARATOR
+COLOR_TEXT = theme.COLOR_TEXT
+COLOR_TEXT_DIM = theme.COLOR_TEXT_DIM
+COLOR_TEXT_FAINT = theme.COLOR_TEXT_FAINT
+COLOR_ACCENT = theme.COLOR_ACCENT
 
-# 格子列表的 QSS：透明背景 + 玻璃圆角悬停/选中 + 半透明细滚动条
-LIST_QSS = (
-    "QListWidget{background:transparent;border:none;color:%s;outline:0;padding:2px;}"
-    "QListWidget::item{border-radius:8px;padding:2px;}"
-    "QListWidget::item:hover{background:rgba(255,255,255,16);}"
-    "QListWidget::item:selected{background:rgba(255,255,255,30);color:#ffffff;"
-    "border:1px solid rgba(255,255,255,88);}"
-    "QScrollBar:vertical{background:transparent;width:8px;margin:2px 1px;}"
-    "QScrollBar::handle:vertical{background:rgba(255,255,255,54);"
-    "border-radius:4px;min-height:28px;}"
-    "QScrollBar::handle:vertical:hover{background:%s;}"
-    "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"
-    "QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:transparent;}"
-) % (COLOR_TEXT, COLOR_ACCENT)
-
-# 紧凑列表专用样式：行距更松弛（用户反馈"别那么紧凑"），左侧配 24px 小图标/缩略图
-COMPACT_LIST_QSS = LIST_QSS + "QListWidget::item{padding:6px 5px;border-radius:7px;}"
-
-# 搜索格子输入框样式：原先未设样式会退回系统浅色默认外观，与玻璃格子格格不入
-SEARCH_EDIT_QSS = (
-    "QLineEdit{background:rgba(255,255,255,14);border:1px solid rgba(255,255,255,34);"
-    "border-radius:8px;padding:5px 8px;color:%s;"
-    "selection-background-color:rgba(255,255,255,70);}"
-    "QLineEdit:focus{border-color:rgba(255,255,255,150);background:rgba(255,255,255,22);}"
-) % COLOR_TEXT
+LIST_QSS = theme.GRID_QSS
+COMPACT_LIST_QSS = theme.COMPACT_LIST_QSS
+SEARCH_EDIT_QSS = theme.SEARCH_EDIT_QSS
 
 # 共享图标提供器：全局仅创建一次，Windows 资源管理器图标缓存复用
 _ICON_PROVIDER = None
@@ -879,9 +856,12 @@ class FileWidget(QWidget):
         self._resizable = True         # 是否允许拖边缘调整大小（扁平搜索条关闭）
         self._bar_mode = False         # 是否"只有内容区、无标题栏"的扁平形态
         self._drag_pos = None          # 窗口拖动的起始鼠标偏移
+        self._drag_screens = None      # 拖动期间复用的屏幕矩形快照
         self._resize_edge = None       # 正在拖拽调整的边缘：right / bottom / corner
         self._resize_from = None       # 调整开始时的 (鼠标全局坐标, 宽, 高)
         self._position_ready = False   # 首次 show 之前不保存位置（避免覆盖记忆值）
+        self._layout_provisional = False  # 目标屏未就绪：当前位置仅临时显示，不写回
+        self._layout_desired_rect = None  # 目标屏恢复后应回到的保存矩形
         self._drag_active = False      # 是否有文件正悬停拖拽在本格子上（高亮提示）
         self._item_total = 0           # 最近一次刷新的条目总数（供标题旁计数显示）
         self._is_empty = False         # 最近一次刷新是否为空（空状态走引导布局）
@@ -902,22 +882,30 @@ class FileWidget(QWidget):
 
         # 标题栏：分类名（含条目数）+ 打开文件夹按钮
         title_row = QHBoxLayout()
+        title_row.setSpacing(6)
+        self.accent_bar = QLabel()
+        self.accent_bar.setFixedSize(3, 14)
+        self.accent_bar.setStyleSheet(
+            f"background:{theme.PALETTE['jade']};border-radius:1px;")
         self.title_label = QLabel(title)
-        self.title_label.setFont(QFont("Microsoft YaHei UI", 11, QFont.Bold))
+        self.title_label.setFont(
+            QFont(theme.FONT_FAMILY, 11, QFont.DemiBold))
         self.title_label.setStyleSheet(f"color:{COLOR_TEXT};background:transparent;")
         self.count_label = QLabel("")
-        self.count_label.setFont(QFont("Microsoft YaHei UI", 8))
+        self.count_label.setFont(QFont(theme.FONT_FAMILY, 8))
         self.count_label.setStyleSheet(
             f"color:{COLOR_TEXT_DIM};background:transparent;")
         self.open_btn = QLabel("打开")
-        self.open_btn.setFont(QFont("Microsoft YaHei UI", 9))
-        # "打开"按钮：胶囊形文字按钮，悬停时叠一层浅底，提示可点击
+        self.open_btn.setFont(QFont(theme.FONT_FAMILY, 9))
+        # "打开"按钮：低调文字按钮，悬停时叠一层深青浅底。
         self.open_btn.setStyleSheet(
             f"QLabel{{color:{COLOR_ACCENT};background:transparent;"
-            "padding:2px 7px;border-radius:7px;}"
-            "QLabel:hover{background:rgba(255,255,255,44);}")
+            "padding:3px 8px;border-radius:8px;}"
+            "QLabel:hover{background:rgba(47,111,98,18);}")
         self.open_btn.setCursor(Qt.PointingHandCursor)
         self.open_btn.mousePressEvent = self._open_folder  # 点击打开收纳文件夹
+        title_row.addWidget(self.accent_bar)
+        title_row.addSpacing(4)
         title_row.addWidget(self.title_label)
         title_row.addWidget(self.count_label)
         title_row.addStretch()
@@ -964,59 +952,50 @@ class FileWidget(QWidget):
     # ---------- 外观绘制 ----------
 
     def paintEvent(self, event):
-        """绘制玻璃拟态背景：渐变毛玻璃基底 + 顶部高光 + 双层描边 + 渐隐标题分隔线。
+        """直接绘制瓷白纸面：纸色渐变 + 细边 + 内高光 + 渐隐分隔线。
 
-        绘制顺序（后画的压在前画的上面）决定了玻璃质感：
-        1) 竖向渐变基底：上方偏亮、下方偏暗，模拟光线自上方透入玻璃；
-        2) 顶部高光：标题栏高度内由浅白渐隐到全透明，形成玻璃表面反射；
-        3) 外描边 + 内高光描边：深底配亮边，是"玻璃边缘"的关键；
-        4) 标题分隔线：左右两端渐隐，比一条实线更精致。
+        刻意不在 QImage/QPixmap 上做离屏缓存：PySide6/Windows 下离屏
+        QPainter 对象在解释器退出阶段可能触发堆损坏。这里每次只画两张
+        小圆角路径，开销远低于文件列表刷新。
         """
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        # 内缩半像素：让 1px 描边完整落在像素内，避免被窗口边缘裁掉一半显得发虚
+        width, height = self.width(), self.height()
         path = QPainterPath()
         path.addRoundedRect(
-            QRectF(0.5, 0.5, self.width() - 1, self.height() - 1),
+            QRectF(0.5, 0.5, width - 1, height - 1),
             CORNER_RADIUS, CORNER_RADIUS)
-
-        # 1) 毛玻璃基底：竖向渐变
-        base = QLinearGradient(0, 0, 0, self.height())
+        base = QLinearGradient(0, 0, 0, height)
         base.setColorAt(0.0, COLOR_BG)
         base.setColorAt(1.0, COLOR_BG_BOTTOM)
         painter.fillPath(path, QBrush(base))
 
-        # 2) 顶部高光：只在标题栏附近渐隐，避免整块发灰
-        glow = QLinearGradient(0, 0, 0, TITLE_BAR_HEIGHT + 26)
-        glow.setColorAt(0.0, COLOR_GLOW)
-        glow.setColorAt(1.0, QColor(255, 255, 255, 0))
-        painter.fillPath(path, QBrush(glow))
-
-        if self._drag_active:            # 有文件拖拽悬停：仅用中性描边强调，不用霓虹色
-            painter.fillPath(path, QColor(255, 255, 255, 18))
-            painter.setPen(QPen(QColor(COLOR_ACCENT), 1.5))
-        else:
-            painter.setPen(QPen(COLOR_BORDER, 1))
-        painter.drawPath(path)
-
-        # 3) 内高光描边：再描一圈更淡更窄的圆角线，做出玻璃的"厚度"
         inner = QPainterPath()
         inner.addRoundedRect(
-            QRectF(1.5, 1.5, self.width() - 3, self.height() - 3),
+            QRectF(1.5, 1.5, width - 3, height - 3),
             CORNER_RADIUS - 1, CORNER_RADIUS - 1)
         painter.setPen(QPen(COLOR_INNER_HIGHLIGHT, 1))
         painter.drawPath(inner)
+        painter.setPen(QPen(COLOR_BORDER, 1))
+        painter.drawPath(path)
 
-        # 4) 标题分隔线：中间实、两端渐隐
-        # 扁平形态（搜索条）没有标题栏、收起形态列表不可见：都直接跳过
         if not self._bar_mode and not self._collapsed:
-            separator = QLinearGradient(12, 0, self.width() - 12, 0)
-            separator.setColorAt(0.0, QColor(255, 255, 255, 0))
+            separator = QLinearGradient(14, 0, width - 14, 0)
+            separator.setColorAt(0.0, QColor(31, 35, 39, 0))
             separator.setColorAt(0.5, COLOR_SEPARATOR)
-            separator.setColorAt(1.0, QColor(255, 255, 255, 0))
+            separator.setColorAt(1.0, QColor(31, 35, 39, 0))
             painter.setPen(QPen(QBrush(separator), 1))
-            painter.drawLine(12, TITLE_BAR_HEIGHT,
-                             self.width() - 12, TITLE_BAR_HEIGHT)
+            painter.drawLine(14, TITLE_BAR_HEIGHT,
+                             width - 14, TITLE_BAR_HEIGHT)
+
+        if self._drag_active:
+            highlight = QPainterPath()
+            highlight.addRoundedRect(
+                QRectF(1, 1, width - 2, height - 2),
+                CORNER_RADIUS - 1, CORNER_RADIUS - 1)
+            painter.fillPath(highlight, QColor(47, 111, 98, 16))
+            painter.setPen(QPen(theme.GRID_ACCENT, 1.5))
+            painter.drawPath(highlight)
 
     # ---------- 窗口拖动与位置记忆 ----------
 
@@ -1029,9 +1008,11 @@ class FileWidget(QWidget):
                 self._resize_from = (event.globalPosition().toPoint(),
                                      self.x(), self.y(),
                                      self.width(), self.height())
+                self._drag_screens = current_screen_rects()
                 event.accept()
                 return
             self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self._drag_screens = current_screen_rects()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -1044,7 +1025,7 @@ class FileWidget(QWidget):
                 self._resize_edge, (x0, y0, width0, height0), delta, peers)
             # 缩放同样不能越出屏幕：右/下缘拖过头时以屏幕边缘为界收住
             clamped = clamp_rect_to_screens(
-                QRect(*geometry), current_screen_rects())
+                QRect(*geometry), self._drag_screens or current_screen_rects())
             geometry = (clamped.x(), clamped.y(),
                         clamped.width(), clamped.height())
             if guides:
@@ -1069,7 +1050,7 @@ class FileWidget(QWidget):
             # 屏幕边界钳制：拖到边缘/拖出屏幕时，格子会停在屏幕可见区域内
             pos = clamp_rect_to_screens(
                 QRect(pos, QSize(self.width(), self.height())),
-                current_screen_rects()).topLeft()
+                self._drag_screens or current_screen_rects()).topLeft()
             self.move(pos)
             if self._position_ready:
                 self._pos_timer.start(POSITION_SAVE_DELAY_MS)
@@ -1094,6 +1075,7 @@ class FileWidget(QWidget):
         self._resize_edge = None
         self._resize_from = None
         self._drag_pos = None
+        self._drag_screens = None
         self._hide_guides()
         self._clamp_into_screens()       # 兜底：鼠标操作结束后保证完全在屏幕内
         super().mouseReleaseEvent(event)
@@ -1392,10 +1374,10 @@ class FileWidget(QWidget):
         self._cell_w = geo["cell_w"]
         self._cell_h = geo["cell_h"]
         self.title_label.setFont(
-            QFont("Microsoft YaHei UI", geo["title_pt"], QFont.Bold))
-        self.count_label.setFont(QFont("Microsoft YaHei UI", geo["small_pt"]))
-        self.open_btn.setFont(QFont("Microsoft YaHei UI", geo["open_pt"]))
-        self.list_widget.setFont(QFont("Microsoft YaHei UI", geo["item_pt"]))
+            QFont(theme.FONT_FAMILY, geo["title_pt"], QFont.DemiBold))
+        self.count_label.setFont(QFont(theme.FONT_FAMILY, geo["small_pt"]))
+        self.open_btn.setFont(QFont(theme.FONT_FAMILY, geo["open_pt"]))
+        self.list_widget.setFont(QFont(theme.FONT_FAMILY, geo["item_pt"]))
         self._apply_view_mode()
 
     def _zoom(self, direction: int):
@@ -1445,53 +1427,67 @@ class FileWidget(QWidget):
 
     def refresh(self):
         """重新读取收纳文件夹内容并刷新列表（文件夹在前、文件在后）。"""
-        self.list_widget.clear()
-        self._thumb_items.clear()          # 列表已重建：旧的待回填条目全部作废
+        # 构建期间暂停重绘：200 个条目逐个 addItem 时避免整列表反复刷新。
+        self.list_widget.setUpdatesEnabled(False)
         try:
-            names = sorted(os.listdir(self.folder), key=str.lower)
-        except OSError:
-            names = []
-        dirs, files = [], []
-        for name in names:
-            full = os.path.join(self.folder, name)
-            (dirs if os.path.isdir(full) else files).append((name, full))
-        total = len(dirs) + len(files)
-        self._update_count_label(total)
-        was_empty = self._is_empty                 # 记录刷新前状态：由空转非空需恢复布局
-        self._is_empty = (total == 0)
+            self.list_widget.clear()
+            self._thumb_items.clear()      # 列表已重建：旧的待回填条目全部作废
+            dirs, files = [], []
+            try:
+                # 单次目录遍历同时拿到名称/类型/完整路径，避免每项再 os.path.isdir。
+                with os.scandir(self.folder) as entries:
+                    for entry in entries:
+                        try:
+                            is_dir = entry.is_dir()
+                        except OSError:
+                            is_dir = False
+                        (dirs if is_dir else files).append(
+                            (entry.name, entry.path))
+            except OSError:
+                pass
+            dirs.sort(key=lambda item: item[0].casefold())
+            files.sort(key=lambda item: item[0].casefold())
+            total = len(dirs) + len(files)
+            self._update_count_label(total)
+            was_empty = self._is_empty        # 记录刷新前状态：由空转非空需恢复布局
+            self._is_empty = (total == 0)
 
-        if total == 0:                        # 空状态引导：主提示 + 可发现性提示
-            main_tip = QListWidgetItem("拖入文件或文件夹即可收纳")
-            main_tip.setFlags(Qt.NoItemFlags)
-            main_tip.setTextAlignment(Qt.AlignCenter)
-            main_tip.setForeground(QBrush(QColor("#8c96aa")))
-            self.list_widget.addItem(main_tip)
-            hint = QListWidgetItem("右键空白处：新建 / 映射 / 预览方式")
-            hint.setFlags(Qt.NoItemFlags)
-            hint.setTextAlignment(Qt.AlignCenter)
-            hint.setForeground(QBrush(QColor(COLOR_TEXT_FAINT)))
-            self.list_widget.addItem(hint)
-            self._apply_guide_layout()        # 切单列宽行：引导文字不再被网格挤成竖排
-            return
+            if total == 0:                    # 空状态引导：主提示 + 可发现性提示
+                main_tip = QListWidgetItem("拖入文件或文件夹即可收纳")
+                main_tip.setFlags(Qt.NoItemFlags)
+                main_tip.setTextAlignment(Qt.AlignCenter)
+                main_tip.setForeground(QBrush(QColor(theme.PALETTE["ink_soft"])))
+                self.list_widget.addItem(main_tip)
+                hint = QListWidgetItem("右键空白处：新建 / 映射 / 预览方式")
+                hint.setFlags(Qt.NoItemFlags)
+                hint.setTextAlignment(Qt.AlignCenter)
+                hint.setForeground(QBrush(QColor(COLOR_TEXT_FAINT)))
+                self.list_widget.addItem(hint)
+                self._apply_guide_layout()    # 切单列宽行：引导文字不被网格挤成竖排
+                return
 
-        if was_empty:                         # 由空转非空：撤销引导布局，回到预览方式
-            self._apply_view_mode()
-        entries = dirs + files
-        shown = entries[:MAX_LIST_ITEMS]
-        for name, full in shown:
-            item = QListWidgetItem(name)
-            item.setData(Qt.UserRole, full)   # 完整路径存 UserRole，打开时取用
-            item.setToolTip(full)
-            if self.preview_icons:
-                item.setTextAlignment(Qt.AlignHCenter)        # 图标与文字在单元格内水平居中
-            else:
-                item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            self._set_item_icon(item, full)   # 图片走缩略图，其余走系统图标
-            self.list_widget.addItem(item)
-        if total > MAX_LIST_ITEMS:            # 超出上限时显示提示占位条目
-            tip = QListWidgetItem(f"… 共 {total} 项，点右上角\"打开\"查看全部")
-            tip.setFlags(Qt.NoItemFlags)      # 不可选中/双击
-            self.list_widget.addItem(tip)
+            if was_empty:                     # 由空转非空：撤销引导布局，回到预览方式
+                self._apply_view_mode()
+            entries = dirs + files
+            shown = entries[:MAX_LIST_ITEMS]
+            for name, full in shown:
+                item = QListWidgetItem(name)
+                item.setData(Qt.UserRole, full)   # 完整路径存 UserRole
+                item.setToolTip(full)
+                if self.preview_icons:
+                    item.setTextAlignment(Qt.AlignHCenter)
+                else:
+                    item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                self._set_item_icon(item, full)   # 图片走缩略图，其余走系统图标
+                self.list_widget.addItem(item)
+            if total > MAX_LIST_ITEMS:        # 超出上限时显示提示占位条目
+                tip = QListWidgetItem(
+                    f"… 共 {total} 项，点右上角\"打开\"查看全部")
+                tip.setFlags(Qt.NoItemFlags)  # 不可选中/双击
+                self.list_widget.addItem(tip)
+        finally:
+            self.list_widget.setUpdatesEnabled(True)
+            self.list_widget.viewport().update()
 
     def _set_item_icon(self, item: QListWidgetItem, path: str):
         """给条目设置图标：图片显示内容缩略图，其余显示 Windows 系统图标。
@@ -1562,15 +1558,7 @@ class FileWidget(QWidget):
             item.setSelected(True)            # 右键未选中条目时先选中它（支持多选批量操作）
         menu = QMenu(self)
         # 右键菜单沿用全局玻璃配色：深底 + 浅白边 + 强调色选中块
-        menu.setStyleSheet(
-            ("QMenu{background:#1c1f26;color:%s;border:1px solid rgba(255,255,255,38);"
-             "border-radius:10px;padding:6px;}"
-             "QMenu::item{padding:6px 20px;border-radius:7px;}"
-             "QMenu::item:selected{background:rgba(255,255,255,60);color:#ffffff;}"
-             "QMenu::separator{height:1px;background:rgba(255,255,255,26);"
-             "margin:5px 8px;}"
-             ) % COLOR_TEXT
-        )
+        menu.setStyleSheet(theme.MENU_QSS)
         if item is not None:
             path = item.data(Qt.UserRole)
             menu.addAction("打开", lambda: open_in_shell(path))
@@ -1743,6 +1731,7 @@ class SearchWidget(FileWidget):
         self._resizable = False            # 扁平搜索条：不允许拖边缘调整尺寸
         # 扁平化外观：隐藏标题栏、计数与"打开"按钮，只留输入框
         self.title_label.hide()
+        self.accent_bar.hide()
         self.count_label.hide()
         self.open_btn.hide()
         self.layout().setContentsMargins(8, 6, 8, 6)

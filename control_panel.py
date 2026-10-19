@@ -14,68 +14,27 @@ import webbrowser
 
 from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,
-                               QDialog, QFileDialog, QGridLayout,
-                               QHBoxLayout, QLabel, QLineEdit, QListWidget,
-                               QListWidgetItem, QMessageBox, QPushButton,
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox,
+                               QComboBox, QDialog, QFileDialog, QFrame,
+                               QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+                               QListWidget, QListWidgetItem, QMessageBox,
+                               QPushButton, QScrollArea, QStackedWidget,
                                QTextBrowser, QVBoxLayout, QWidget)
 
 import autostart
 import config as cfg
 import organizer as org
 import shell_menu
+import theme
 import updater
-from widgets import COLOR_ACCENT, COLOR_TEXT, COLOR_TEXT_DIM, open_in_shell
+from widgets import COLOR_ACCENT, COLOR_TEXT, open_in_shell
 
-PANEL_WIDTH = 1000   # 面板宽度（横向三栏布局）
-PANEL_HEIGHT = 620   # 面板高度
+PANEL_WIDTH = 1080   # 面板宽度（左侧导航 + 右侧内容）
+PANEL_HEIGHT = 720   # 面板高度
 SEARCH_DEBOUNCE_MS = 300          # 搜索输入防抖
 SEARCH_RESULT_LIMIT = 100         # 搜索结果上限（与 organizer.search_storage 一致）
 
-# 面板玻璃拟态 QSS：深色底 + 浅白描边 + 半透明控件层叠（与桌面格子同一套语言）
-PANEL_QSS = """
-QWidget{background:#17181b;color:#eceef1;font-family:"Microsoft YaHei UI";font-size:12px;}
-QLabel{background:transparent;}
-QLabel#sectionLabel{color:#9ba1ab;font-size:11px;}
-QPushButton{background:rgba(255,255,255,14);border:1px solid rgba(255,255,255,30);
-            border-radius:9px;padding:7px 14px;color:#eceef1;}
-QPushButton:hover{background:rgba(255,255,255,26);border-color:rgba(255,255,255,150);}
-QPushButton:pressed{background:rgba(255,255,255,8);}
-QPushButton#accentBtn{background:qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                     stop:0 #ccd4dd, stop:1 #a6b0bd);
-                     border:none;color:#14171b;font-weight:bold;border-radius:9px;}
-QPushButton#accentBtn:hover{background:qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                     stop:0 #dbe2e9, stop:1 #b6c0cc);}
-QPushButton#accentBtn:pressed{background:#a6b0bd;}
-QLineEdit{background:rgba(255,255,255,10);border:1px solid rgba(255,255,255,28);
-          border-radius:9px;padding:6px 10px;color:#eceef1;
-          selection-background-color:rgba(255,255,255,70);}
-QLineEdit:focus{border-color:rgba(255,255,255,150);background:rgba(255,255,255,16);}
-QComboBox{background:rgba(255,255,255,10);border:1px solid rgba(255,255,255,28);
-          border-radius:9px;padding:5px 10px;color:#eceef1;}
-QComboBox:hover{border-color:rgba(255,255,255,150);}
-QComboBox::drop-down{border:none;width:22px;}
-QComboBox QAbstractItemView{background:#1d2129;color:#eceef1;outline:0;
-          border:1px solid rgba(255,255,255,30);border-radius:8px;padding:4px;
-          selection-background-color:rgba(255,255,255,70);}
-QListWidget{background:rgba(0,0,0,70);border:1px solid rgba(255,255,255,26);
-            border-radius:10px;outline:0;padding:4px;}
-QListWidget::item{padding:6px;border-radius:7px;}
-QListWidget::item:hover{background:rgba(255,255,255,16);}
-QListWidget::item:selected{background:rgba(255,255,255,60);color:#ffffff;}
-QScrollBar:vertical{background:transparent;width:8px;margin:2px;}
-QScrollBar::handle:vertical{background:rgba(255,255,255,50);border-radius:4px;
-                            min-height:28px;}
-QScrollBar::handle:vertical:hover{background:#93a1b3;}
-QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}
-QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:transparent;}
-QPushButton#dangerBtn{background:rgba(224,82,82,38);border:1px solid rgba(255,120,120,120);
-                      color:#ffb9b9;font-weight:bold;}
-QPushButton#dangerBtn:hover{background:rgba(224,82,82,70);border-color:rgba(255,140,140,190);}
-QPushButton#dangerBtn:pressed{background:rgba(224,82,82,20);}
-QLabel#titleLabel{font-size:15px;font-weight:bold;}
-QLabel#versionTag{color:#9ba1ab;font-size:11px;padding-top:3px;}
-"""
+PANEL_QSS = theme.PANEL_QSS
 
 
 class GlassCheckBox(QCheckBox):
@@ -91,6 +50,7 @@ class GlassCheckBox(QCheckBox):
     def __init__(self, text: str = "", parent=None):
         super().__init__(text, parent)
         self.setAttribute(Qt.WA_Hover, True)   # 开启悬停事件以支持 hover 反馈
+        self.setMinimumHeight(30)
 
     def paintEvent(self, event):
         """自绘：左侧圆角指示器 + 右侧文字（按勾选/悬停状态切换配色）。"""
@@ -115,9 +75,9 @@ class GlassCheckBox(QCheckBox):
                 QPointF(left + box * 0.75, top + box * 0.32),
             ])
         else:                                   # 未选中：半透明玻璃小方块，悬停时提亮
-            # 面板底色本身很暗，透明度太低会"看不见勾选框"——提高描边/填充对比度
-            painter.setPen(QPen(QColor(255, 255, 255, 110 if hovered else 78), 1))
-            painter.setBrush(QColor(255, 255, 255, 40 if hovered else 24))
+            painter.setPen(QPen(
+                QColor(31, 35, 39, 120 if hovered else 76), 1))
+            painter.setBrush(QColor(31, 35, 39, 12))
             painter.drawRoundedRect(rect, 5, 5)
 
         painter.setPen(QColor(COLOR_TEXT))
@@ -221,6 +181,13 @@ class AboutDialog(QDialog):
 class ControlPanel(QWidget):
     """主控制窗口，所有整理操作的入口。"""
 
+    PAGE_SPECS = (
+        ("整理", "桌面整理", "把散落在桌面的文件归入对应的收纳格子。"),
+        ("格子", "格子", "决定桌面上显示哪些收纳格，以及它们的呈现方式。"),
+        ("设置", "设置", "启动、整理规则与 Windows 集成。"),
+        ("关于", "关于", "版本、配置与完整更新日志。"),
+    )
+
     def __init__(self, ctx):
         """初始化面板。
 
@@ -231,215 +198,73 @@ class ControlPanel(QWidget):
         super().__init__()
         self.ctx = ctx
         self.setWindowTitle(f"桌面分类助手 v{cfg.APP_VERSION} - 控制面板")
-        # 横向三栏布局：宽高都按屏幕可用空间钳制（小屏笔记本不会被截断）
+        # 宽高都按屏幕可用空间钳制（小屏笔记本不会被截断）
         screen = QApplication.primaryScreen().availableGeometry()
         self.resize(min(PANEL_WIDTH, screen.width() - 40),
                     min(PANEL_HEIGHT, screen.height() - 80))
         self.setStyleSheet(PANEL_QSS)
         self._restore_geometry()          # 恢复上次关闭时的面板位置与大小
 
-        layout = QVBoxLayout(self)
-        # ---- 顶栏：标题 + 退出提示（用户反馈"找不到退出"，这里先给一句明确的） ----
+        root_layout = QHBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        root_layout.addWidget(self._build_rail())
+
+        page = QWidget()
+        page.setObjectName("page")
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(30, 26, 30, 18)
+        page_layout.setSpacing(18)
+
         header = QHBoxLayout()
-        title_label = QLabel("桌面分类助手")
-        title_label.setObjectName("titleLabel")
-        version_tag = QLabel(f"v{cfg.APP_VERSION}")
-        version_tag.setObjectName("versionTag")
-        header.addWidget(title_label)
-        header.addWidget(version_tag)
+        title_block = QVBoxLayout()
+        title_block.setSpacing(3)
+        self.page_title_label = QLabel()
+        self.page_title_label.setObjectName("pageTitle")
+        self.page_subtitle_label = QLabel()
+        self.page_subtitle_label.setObjectName("pageSubtitle")
+        title_block.addWidget(self.page_title_label)
+        title_block.addWidget(self.page_subtitle_label)
+        header.addLayout(title_block)
         header.addStretch()
-        quit_hint = QLabel("关闭窗口只是收起（F8 可再打开）· 彻底退出请用右下角「退出助手」")
-        quit_hint.setObjectName("sectionLabel")
-        header.addWidget(quit_hint)
-        layout.addLayout(header)
+        header_hint = QLabel("F8 随时打开")
+        header_hint.setObjectName("sectionHint")
+        header.addWidget(header_hint)
+        page_layout.addLayout(header)
 
-        # ---- 横向三栏布局：左=整理操作 / 中=格子与开关 / 右=搜索·更新·关于 ----
-        layout.setSpacing(10)
-        body = QHBoxLayout()
-        body.setSpacing(18)
+        self.pages = QStackedWidget()
+        self.pages.addWidget(self._build_overview_page())
+        self.pages.addWidget(self._build_grids_page())
+        self.pages.addWidget(self._build_settings_page())
+        self.pages.addWidget(self._build_about_page())
+        page_layout.addWidget(self.pages, 1)
 
-        # ============ 左栏：整理操作 ============
-        left = QVBoxLayout()
-        left.setSpacing(8)
-        actions_label = QLabel("整理桌面")
-        actions_label.setObjectName("sectionLabel")
-        left.addWidget(actions_label)
-        self.organize_btn = QPushButton("一键整理桌面")
-        self.organize_btn.setObjectName("accentBtn")
-        self.organize_btn.setFont(QFont("Microsoft YaHei UI", 10, QFont.Bold))
-        self.organize_btn.clicked.connect(self._do_organize)
-        left.addWidget(self.organize_btn)
-        action_row = QHBoxLayout()
-        self.undo_btn = QPushButton("撤销上次整理")
-        self.undo_btn.clicked.connect(self._do_undo)
-        self.restore_btn = QPushButton("恢复全部")
-        self.restore_btn.clicked.connect(self._do_restore)
-        action_row.addWidget(self.undo_btn)
-        action_row.addWidget(self.restore_btn)
-        left.addLayout(action_row)
-
-        root_label = QLabel("收纳目录")
-        root_label.setObjectName("sectionLabel")
-        left.addWidget(root_label)
-        cfg_row = QHBoxLayout()
-        self.root_edit = QLineEdit()
-        self.root_edit.setText(self.ctx.config.get("storageRoot", ""))
-        self.root_edit.editingFinished.connect(self._save_root)
-        browse_btn = QPushButton("浏览...")
-        browse_btn.clicked.connect(self._browse_root)
-        cfg_row.addWidget(self.root_edit, 1)
-        cfg_row.addWidget(browse_btn)
-        left.addLayout(cfg_row)
-
-        launch_label = QLabel("快捷启动")
-        launch_label.setObjectName("sectionLabel")
-        left.addWidget(launch_label)
-        self.shortcut_btn = QPushButton("创建快捷方式（桌面 + 开始菜单）")
-        self.shortcut_btn.clicked.connect(self._create_shortcuts)
-        left.addWidget(self.shortcut_btn)
-        left.addStretch()
-        body.addLayout(left, 3)
-
-        # ============ 中栏：格子与功能开关 ============
-        middle = QVBoxLayout()
-        middle.setSpacing(8)
-        cat_label = QLabel("显示的格子（分类）")
-        cat_label.setObjectName("sectionLabel")
-        middle.addWidget(cat_label)
-        cat_row = QHBoxLayout()
-        self.add_grid_btn = QPushButton("＋ 新建格子")
-        self.add_grid_btn.clicked.connect(self._create_grid)
-        self.map_folder_btn = QPushButton("映射文件夹…")
-        self.map_folder_btn.clicked.connect(self.ctx.map_folder_interactive)
-        cat_row.addWidget(self.add_grid_btn)
-        cat_row.addWidget(self.map_folder_btn)
-        cat_row.addStretch()
-        middle.addLayout(cat_row)
-        self._cat_grid = QGridLayout()
-        self._cat_grid.setHorizontalSpacing(10)
-        middle.addLayout(self._cat_grid)
-        self._rebuild_category_checks()
-
-        option_label = QLabel("功能开关")
-        option_label.setObjectName("sectionLabel")
-        middle.addWidget(option_label)
-        option_grid = QGridLayout()
-        self.shortcut_check = GlassCheckBox("整理时收走快捷方式")
-        self.shortcut_check.setChecked(
-            bool(self.ctx.config.get("includeShortcuts", False)))
-        self.shortcut_check.toggled.connect(self._save_shortcut_option)
-        self.folder_check = GlassCheckBox("整理时收走文件夹")
-        self.folder_check.setChecked(
-            bool(self.ctx.config.get("includeFolders", True)))
-        self.folder_check.toggled.connect(self._save_folder_option)
-        self.autostart_check = GlassCheckBox("开机自启")
-        self.autostart_check.setChecked(autostart.get_autostart_enabled())
-        self.autostart_check.toggled.connect(self._toggle_autostart)
-        self.game_check = GlassCheckBox("游戏模式（隐藏格子并暂停监听）")
-        self.game_check.setChecked(
-            bool(self.ctx.config.get("gameMode", False)))
-        self.game_check.toggled.connect(
-            lambda checked: self.ctx.set_game_mode(checked))
-        preview_label = QLabel("预览方式（全部格子）:")
-        self.preview_combo = QComboBox()
-        self.preview_combo.addItems(["图标视图", "紧凑列表"])
-        self.preview_combo.setCurrentIndex(
-            0 if self.ctx.config.get("previewIcons", True) else 1)
-        self.preview_combo.currentIndexChanged.connect(self._change_preview)
-        option_grid.addWidget(self.autostart_check, 0, 0)
-        option_grid.addWidget(self.game_check, 0, 1)
-        option_grid.addWidget(self.shortcut_check, 1, 0)
-        option_grid.addWidget(self.folder_check, 1, 1)
-        option_grid.addWidget(preview_label, 2, 0)
-        option_grid.addWidget(self.preview_combo, 2, 1)
-        self.confirm_check = GlassCheckBox("整理前先预览确认")
-        self.confirm_check.setChecked(
-            bool(self.ctx.config.get("confirmOrganize", True)))
-        self.confirm_check.toggled.connect(self._save_confirm_option)
-        option_grid.addWidget(self.confirm_check, 3, 0)
-        self.auto_check = GlassCheckBox("自动整理新桌面文件")
-        self.auto_check.setChecked(
-            bool(self.ctx.config.get("autoOrganize", False)))
-        self.auto_check.toggled.connect(
-            lambda checked: self.ctx.set_auto_organize(checked))
-        self.auto_delay_combo = QComboBox()
-        self.auto_delay_combo.addItems(["静置 30 秒", "静置 5 分钟", "静置 30 分钟"])
-        self._auto_delay_values = [30, 300, 1800]
-        try:
-            current_delay = int(self.ctx.config.get("autoOrganizeDelay", 300))
-        except (TypeError, ValueError):
-            current_delay = 300
-        self.auto_delay_combo.setCurrentIndex(
-            self._auto_delay_values.index(current_delay)
-            if current_delay in self._auto_delay_values else 1)
-        self.auto_delay_combo.currentIndexChanged.connect(
-            lambda index: self.ctx.set_auto_organize_delay(
-                self._auto_delay_values[index]))
-        option_grid.addWidget(self.auto_check, 4, 0)
-        option_grid.addWidget(self.auto_delay_combo, 4, 1)
-        self.search_grid_check = GlassCheckBox("桌面搜索格子")
-        self.search_grid_check.setChecked(
-            bool(self.ctx.config.get("searchGrid", False)))
-        self.search_grid_check.toggled.connect(
-            lambda checked: self.ctx.set_search_grid(checked))
-        option_grid.addWidget(self.search_grid_check, 5, 0)
-        # 桌面右键菜单（一键整理）：Windows 注册表集成，实际状态以注册表为准
-        self.shell_menu_check = GlassCheckBox("桌面右键菜单（一键整理）")
-        self.shell_menu_check.setChecked(shell_menu.is_registered())
-        self.shell_menu_check.setToolTip(shell_menu.platform_menu_hint())
-        self.shell_menu_check.toggled.connect(self._toggle_shell_menu)
-        option_grid.addWidget(self.shell_menu_check, 6, 0)
-        middle.addLayout(option_grid)
-        middle.addStretch()
-        body.addLayout(middle, 3)
-
-        # ============ 右栏：搜索 / 版本与更新 / 关于 ============
-        right = QVBoxLayout()
-        right.setSpacing(8)
-        search_label = QLabel("搜索收纳库")
-        search_label.setObjectName("sectionLabel")
-        right.addWidget(search_label)
-        self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("输入文件名关键词，如：报告")
-        right.addWidget(self.search_edit)
-        self.search_list = QListWidget()
-        self.search_list.itemDoubleClicked.connect(self._open_search_item)
-        right.addWidget(self.search_list, 1)   # 拉伸占据右栏剩余空间
-        locate_row = QHBoxLayout()
-        locate_btn = QPushButton("打开所在位置")
-        locate_btn.clicked.connect(self._locate_search_item)
-        locate_row.addStretch()
-        locate_row.addWidget(locate_btn)
-        right.addLayout(locate_row)
-
-        update_label = QLabel("版本与更新")
-        update_label.setObjectName("sectionLabel")
-        right.addWidget(update_label)
-        update_row = QHBoxLayout()
-        self.version_label = QLabel(f"当前版本 v{cfg.APP_VERSION}")
-        self.version_label.setStyleSheet(
-            f"color:{COLOR_TEXT_DIM};background:transparent;")
-        update_row.addWidget(self.version_label)
-        update_row.addStretch()
-        self.update_btn = QPushButton("检查更新")
-        self.update_btn.clicked.connect(self._check_update)
-        update_row.addWidget(self.update_btn)
-        right.addLayout(update_row)
-        url_row = QHBoxLayout()
-        url_label = QLabel("更新源:")
-        self.update_url_edit = QLineEdit()
-        self.update_url_edit.setPlaceholderText(
-            "新版本清单 JSON 地址（留空=不可检查）")
-        self.update_url_edit.setText(self.ctx.config.get("updateUrl", ""))
-        self.update_url_edit.editingFinished.connect(self._save_update_url)
-        url_row.addWidget(url_label)
-        url_row.addWidget(self.update_url_edit, 1)
-        right.addLayout(url_row)
-        body.addLayout(right, 4)
-
-        layout.addLayout(body, 1)
-
-        # ---- 第五行：搜索与关于已并入右栏（见上方三栏布局） ----
+        footer = QHBoxLayout()
+        self.status_label = QLabel("就绪")
+        self.status_label.setObjectName("statusLabel")
+        footer.addWidget(self.status_label, 1)
+        self.open_storage_btn = QPushButton("打开收纳库")
+        self.open_storage_btn.setToolTip("在资源管理器中打开收纳库目录")
+        self.open_storage_btn.clicked.connect(self._open_storage)
+        footer.addWidget(self.open_storage_btn)
+        self.open_config_btn = QPushButton("打开配置目录")
+        self.open_config_btn.setToolTip(
+            f"配置与整理历史都在这里：{cfg.CONFIG_DIR}")
+        self.open_config_btn.clicked.connect(
+            lambda: open_in_shell(cfg.CONFIG_DIR))
+        footer.addWidget(self.open_config_btn)
+        self.about_btn = QPushButton("关于")
+        self.about_btn.setToolTip("详情介绍 / 更新日志 / 免责声明")
+        self.about_btn.clicked.connect(self._show_about)
+        footer.addWidget(self.about_btn)
+        self.exit_btn = QPushButton("退出助手")
+        self.exit_btn.setObjectName("dangerBtn")
+        self.exit_btn.setToolTip(
+            "停止格子与文件监听并退出程序（收纳库、历史与设置都会保留）")
+        self.exit_btn.clicked.connect(self._request_quit)
+        footer.addWidget(self.exit_btn)
+        page_layout.addLayout(footer)
+        root_layout.addWidget(page, 1)
 
         # 搜索防抖：停止输入 300ms 后才提交请求
         self._search_timer = QTimer(self)
@@ -463,30 +288,336 @@ class ControlPanel(QWidget):
         self.update_service.progress.connect(self._on_update_progress)
         self._pending_manifest = None
 
-        # ---- 底栏：状态 + 常用入口 + 退出（面板上的"出口"，必须显眼） ----
-        footer = QHBoxLayout()
-        self.status_label = QLabel("就绪")
-        self.status_label.setStyleSheet(
-            f"color:{COLOR_TEXT_DIM};background:transparent;padding:2px;")
-        footer.addWidget(self.status_label, 1)
-        self.open_storage_btn = QPushButton("打开收纳库")
-        self.open_storage_btn.setToolTip("在资源管理器中打开收纳库目录")
-        self.open_storage_btn.clicked.connect(self._open_storage)
-        footer.addWidget(self.open_storage_btn)
-        self.open_config_btn = QPushButton("打开配置目录")
-        self.open_config_btn.setToolTip(f"配置与整理历史都在这里：{cfg.CONFIG_DIR}")
-        self.open_config_btn.clicked.connect(lambda: open_in_shell(cfg.CONFIG_DIR))
-        footer.addWidget(self.open_config_btn)
-        self.about_btn = QPushButton("关于")
-        self.about_btn.setToolTip("详情介绍 / 更新日志 / 免责声明")
-        self.about_btn.clicked.connect(self._show_about)
-        footer.addWidget(self.about_btn)
-        self.exit_btn = QPushButton("退出助手")
-        self.exit_btn.setObjectName("dangerBtn")
-        self.exit_btn.setToolTip("停止格子与文件监听并退出程序（收纳库、历史与设置都会保留）")
-        self.exit_btn.clicked.connect(self._request_quit)
-        footer.addWidget(self.exit_btn)
-        layout.addLayout(footer)
+        self._switch_page(0)
+
+    def _build_rail(self) -> QWidget:
+        """左侧导航：深色窄栏承载品牌与四个页面入口。"""
+        rail = QWidget()
+        rail.setObjectName("rail")
+        rail.setFixedWidth(208)
+        layout = QVBoxLayout(rail)
+        layout.setContentsMargins(22, 24, 18, 18)
+        layout.setSpacing(6)
+
+        brand = QLabel("桌面分类")
+        brand.setObjectName("brand")
+        brand_sub = QLabel("桌面文件收纳")
+        brand_sub.setObjectName("brandSub")
+        layout.addWidget(brand)
+        layout.addWidget(brand_sub)
+        layout.addSpacing(24)
+
+        self.nav_buttons = []
+        group = QButtonGroup(self)
+        group.setExclusive(True)
+        for index, (label, _title, _subtitle) in enumerate(self.PAGE_SPECS):
+            button = QPushButton(label)
+            button.setObjectName("navBtn")
+            button.setCheckable(True)
+            button.setCursor(Qt.PointingHandCursor)
+            button.clicked.connect(
+                lambda _checked=False, page_index=index:
+                self._switch_page(page_index))
+            group.addButton(button, index)
+            layout.addWidget(button)
+            self.nav_buttons.append(button)
+
+        layout.addStretch()
+        version = QLabel(f"v{cfg.APP_VERSION}")
+        version.setObjectName("railVersion")
+        layout.addWidget(version)
+        hint = QLabel("关闭窗口不会退出")
+        hint.setObjectName("railVersion")
+        layout.addWidget(hint)
+        return rail
+
+    def _switch_page(self, index: int):
+        """切换左侧导航页并同步标题。"""
+        index = max(0, min(len(self.PAGE_SPECS) - 1, int(index)))
+        self.pages.setCurrentIndex(index)
+        _label, title, subtitle = self.PAGE_SPECS[index]
+        self.page_title_label.setText(title)
+        self.page_subtitle_label.setText(subtitle)
+        for button_index, button in enumerate(self.nav_buttons):
+            button.setChecked(button_index == index)
+
+    @staticmethod
+    def _scroll_page(content: QWidget) -> QScrollArea:
+        """给页面加透明滚动容器，小屏/高 DPI 下内容不被截断。"""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(content)
+        return scroll
+
+    @staticmethod
+    def _make_card(title: str = "", hint: str = ""):
+        card = QFrame()
+        card.setObjectName("card")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(11)
+        if title:
+            title_label = QLabel(title)
+            title_label.setObjectName("sectionTitle")
+            layout.addWidget(title_label)
+        if hint:
+            hint_label = QLabel(hint)
+            hint_label.setObjectName("sectionHint")
+            hint_label.setWordWrap(True)
+            layout.addWidget(hint_label)
+        return card, layout
+
+    def _build_overview_page(self) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+
+        hero, hero_layout = self._make_card(
+            "整理桌面", "整理前可先预览确认；所有移动都能撤销。")
+        self.organize_btn = QPushButton("一键整理桌面")
+        self.organize_btn.setObjectName("primaryBtn")
+        self.organize_btn.setFont(
+            QFont(theme.FONT_FAMILY, 10, QFont.DemiBold))
+        self.organize_btn.clicked.connect(self._do_organize)
+        hero_layout.addWidget(self.organize_btn)
+        action_row = QHBoxLayout()
+        self.undo_btn = QPushButton("撤销上次整理")
+        self.undo_btn.clicked.connect(self._do_undo)
+        self.restore_btn = QPushButton("恢复全部")
+        self.restore_btn.clicked.connect(self._do_restore)
+        action_row.addWidget(self.undo_btn)
+        action_row.addWidget(self.restore_btn)
+        action_row.addStretch()
+        hero_layout.addLayout(action_row)
+
+        storage, storage_layout = self._make_card(
+            "收纳目录", "所有分类文件夹都保存在这里。")
+        cfg_row = QHBoxLayout()
+        self.root_edit = QLineEdit()
+        self.root_edit.setText(self.ctx.config.get("storageRoot", ""))
+        self.root_edit.setCursorPosition(0)
+        self.root_edit.editingFinished.connect(self._save_root)
+        browse_btn = QPushButton("浏览…")
+        browse_btn.clicked.connect(self._browse_root)
+        cfg_row.addWidget(self.root_edit, 1)
+        cfg_row.addWidget(browse_btn)
+        storage_layout.addLayout(cfg_row)
+
+        search_card, search_layout = self._make_card(
+            "搜索收纳库", "支持文件名、拼音全拼与首字母。")
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("输入文件名关键词，如：报告")
+        search_layout.addWidget(self.search_edit)
+        self.search_list = QListWidget()
+        self.search_list.setMinimumHeight(100)
+        self.search_list.itemDoubleClicked.connect(self._open_search_item)
+        search_layout.addWidget(self.search_list, 1)
+        locate_row = QHBoxLayout()
+        locate_btn = QPushButton("打开所在位置")
+        locate_btn.clicked.connect(self._locate_search_item)
+        locate_row.addStretch()
+        locate_row.addWidget(locate_btn)
+        search_layout.addLayout(locate_row)
+
+        left_column = QVBoxLayout()
+        left_column.setSpacing(16)
+        left_column.addWidget(hero)
+        left_column.addWidget(storage)
+        left_column.addStretch()
+        right_column = QVBoxLayout()
+        right_column.setSpacing(16)
+        right_column.addWidget(search_card, 1)
+        columns = QHBoxLayout()
+        columns.setSpacing(16)
+        columns.addLayout(left_column, 1)
+        columns.addLayout(right_column, 1)
+        layout.addLayout(columns, 1)
+        return self._scroll_page(content)
+
+    def _build_grids_page(self) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+
+        category_card, category_layout = self._make_card(
+            "显示的格子", "勾选需要常驻桌面的分类；自定义分类会出现在这里。")
+        cat_row = QHBoxLayout()
+        self.add_grid_btn = QPushButton("＋ 新建格子")
+        self.add_grid_btn.clicked.connect(self._create_grid)
+        self.map_folder_btn = QPushButton("映射文件夹…")
+        self.map_folder_btn.clicked.connect(self.ctx.map_folder_interactive)
+        cat_row.addWidget(self.add_grid_btn)
+        cat_row.addWidget(self.map_folder_btn)
+        cat_row.addStretch()
+        category_layout.addLayout(cat_row)
+        self._cat_grid = QGridLayout()
+        self._cat_grid.setHorizontalSpacing(10)
+        self._cat_grid.setVerticalSpacing(4)
+        category_layout.addLayout(self._cat_grid)
+        self._rebuild_category_checks()
+        layout.addWidget(category_card)
+
+        appearance, appearance_layout = self._make_card(
+            "呈现方式", "这些设置会立即应用到桌面格子。")
+        preview_row = QHBoxLayout()
+        preview_label = QLabel("默认预览")
+        self.preview_combo = QComboBox()
+        self.preview_combo.addItems(["图标视图", "紧凑列表"])
+        self.preview_combo.setCurrentIndex(
+            0 if self.ctx.config.get("previewIcons", True) else 1)
+        self.preview_combo.currentIndexChanged.connect(self._change_preview)
+        preview_row.addWidget(preview_label)
+        preview_row.addWidget(self.preview_combo, 1)
+        appearance_layout.addLayout(preview_row)
+        self.search_grid_check = GlassCheckBox("显示桌面搜索条")
+        self.search_grid_check.setChecked(
+            bool(self.ctx.config.get("searchGrid", False)))
+        self.search_grid_check.toggled.connect(
+            lambda checked: self.ctx.set_search_grid(checked))
+        appearance_layout.addWidget(self.search_grid_check)
+        tidy_btn = QPushButton("整齐排列全部格子")
+        tidy_btn.clicked.connect(
+            lambda: getattr(self.ctx, "tidy_layout", lambda: None)())
+        appearance_layout.addWidget(tidy_btn)
+        layout.addWidget(appearance)
+        layout.addStretch()
+        return self._scroll_page(content)
+
+    def _build_settings_page(self) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+
+        startup, startup_layout = self._make_card(
+            "启动与桌面", "Win10 登录后自动运行，并保持格子位置。")
+        self.autostart_check = GlassCheckBox("开机自启（Win10 登录后运行）")
+        self.autostart_check.setChecked(autostart.get_autostart_enabled())
+        self.autostart_check.toggled.connect(self._toggle_autostart)
+        startup_layout.addWidget(self.autostart_check)
+        self.game_check = GlassCheckBox("游戏模式（隐藏格子并暂停监听）")
+        self.game_check.setChecked(
+            bool(self.ctx.config.get("gameMode", False)))
+        self.game_check.toggled.connect(
+            lambda checked: self.ctx.set_game_mode(checked))
+        startup_layout.addWidget(self.game_check)
+        self.shell_menu_check = GlassCheckBox("桌面右键菜单（一键整理）")
+        self.shell_menu_check.setChecked(shell_menu.is_registered())
+        self.shell_menu_check.setToolTip(shell_menu.platform_menu_hint())
+        self.shell_menu_check.toggled.connect(self._toggle_shell_menu)
+        startup_layout.addWidget(self.shell_menu_check)
+        startup_layout.addStretch()
+
+        organize, organize_layout = self._make_card(
+            "整理规则", "决定哪些桌面内容会被收走，以及自动整理的时机。")
+        self.shortcut_check = GlassCheckBox("整理时收走快捷方式")
+        self.shortcut_check.setChecked(
+            bool(self.ctx.config.get("includeShortcuts", False)))
+        self.shortcut_check.toggled.connect(self._save_shortcut_option)
+        organize_layout.addWidget(self.shortcut_check)
+        self.folder_check = GlassCheckBox("整理时收走文件夹")
+        self.folder_check.setChecked(
+            bool(self.ctx.config.get("includeFolders", True)))
+        self.folder_check.toggled.connect(self._save_folder_option)
+        organize_layout.addWidget(self.folder_check)
+        self.confirm_check = GlassCheckBox("整理前先预览确认")
+        self.confirm_check.setChecked(
+            bool(self.ctx.config.get("confirmOrganize", True)))
+        self.confirm_check.toggled.connect(self._save_confirm_option)
+        organize_layout.addWidget(self.confirm_check)
+        self.auto_check = GlassCheckBox("自动整理新桌面文件")
+        self.auto_check.setChecked(
+            bool(self.ctx.config.get("autoOrganize", False)))
+        self.auto_check.toggled.connect(
+            lambda checked: self.ctx.set_auto_organize(checked))
+        organize_layout.addWidget(self.auto_check)
+        self.auto_delay_combo = QComboBox()
+        self.auto_delay_combo.addItems(
+            ["静置 30 秒", "静置 5 分钟", "静置 30 分钟"])
+        self._auto_delay_values = [30, 300, 1800]
+        try:
+            current_delay = int(self.ctx.config.get("autoOrganizeDelay", 300))
+        except (TypeError, ValueError):
+            current_delay = 300
+        self.auto_delay_combo.setCurrentIndex(
+            self._auto_delay_values.index(current_delay)
+            if current_delay in self._auto_delay_values else 1)
+        self.auto_delay_combo.currentIndexChanged.connect(
+            lambda index: self.ctx.set_auto_organize_delay(
+                self._auto_delay_values[index]))
+        organize_layout.addWidget(self.auto_delay_combo)
+        organize_layout.addStretch()
+
+        launch, launch_layout = self._make_card(
+            "快捷启动", "创建桌面与开始菜单快捷方式，随时唤起控制面板。")
+        self.shortcut_btn = QPushButton("创建快捷方式（桌面 + 开始菜单）")
+        self.shortcut_btn.clicked.connect(self._create_shortcuts)
+        launch_layout.addWidget(self.shortcut_btn)
+        launch_layout.addStretch()
+
+        update_card, update_layout = self._make_card(
+            "版本与更新", "只有点击「检查更新」时才会访问更新源。")
+        update_row = QHBoxLayout()
+        self.version_label = QLabel(f"当前版本 v{cfg.APP_VERSION}")
+        self.version_label.setObjectName("sectionHint")
+        update_row.addWidget(self.version_label)
+        update_row.addStretch()
+        self.update_btn = QPushButton("检查更新")
+        self.update_btn.clicked.connect(self._check_update)
+        update_row.addWidget(self.update_btn)
+        update_layout.addLayout(update_row)
+        self.update_url_edit = QLineEdit()
+        self.update_url_edit.setPlaceholderText(
+            "新版本清单 JSON 地址（留空=不可检查）")
+        self.update_url_edit.setText(self.ctx.config.get("updateUrl", ""))
+        self.update_url_edit.setCursorPosition(0)
+        self.update_url_edit.editingFinished.connect(self._save_update_url)
+        update_layout.addWidget(self.update_url_edit)
+        update_layout.addStretch()
+
+        columns = QHBoxLayout()
+        columns.setSpacing(16)
+        columns.addWidget(startup, 1)
+        columns.addWidget(organize, 1)
+        layout.addLayout(columns)
+        bottom = QHBoxLayout()
+        bottom.setSpacing(16)
+        bottom.addWidget(launch, 1)
+        bottom.addWidget(update_card, 1)
+        layout.addLayout(bottom)
+        layout.addStretch()
+        return self._scroll_page(content)
+
+    def _build_about_page(self) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+        card, card_layout = self._make_card(
+            "桌面分类助手",
+            "Windows 桌面文件整理工具 · 完全本地运行 · 不上传任何文件")
+        summary = QLabel(
+            "桌面悬浮分类格子、一键整理、拖拽收纳、拼音搜索与可撤销历史。\n"
+            "所有文件与配置都保存在本机；版本号与完整更新日志可在下方查看。")
+        summary.setObjectName("sectionHint")
+        summary.setWordWrap(True)
+        card_layout.addWidget(summary)
+        detail_btn = QPushButton("查看完整介绍与更新日志")
+        detail_btn.clicked.connect(self._show_about)
+        card_layout.addWidget(detail_btn)
+        layout.addWidget(card)
+
+        paths, paths_layout = self._make_card("本机位置")
+        paths_layout.addWidget(QLabel(
+            f"收纳库：{self.ctx.config.get('storageRoot', '')}"))
+        paths_layout.addWidget(QLabel(f"配置：{cfg.CONFIG_DIR}"))
+        layout.addWidget(paths)
+        layout.addStretch()
+        return self._scroll_page(content)
 
     # ---------- 操作回调 ----------
 
