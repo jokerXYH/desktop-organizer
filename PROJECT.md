@@ -6,7 +6,7 @@
 ## 1. 项目是什么
 
 Windows 桌面文件整理工具（Python + PySide6，独立自研）：
-当前版本 v2.10.0，版本历史见仓库根的 CHANGELOG.md。
+当前版本 v2.12.0，版本历史见仓库根的 CHANGELOG.md。
 - 桌面右侧悬浮一排**分类格子窗口**（无边框、半透明、置底、不抢任务栏）
 - 一键整理：把桌面顶层文件/文件夹按扩展名分类移入收纳库
 - 拖拽：把任意文件/文件夹拖进格子即移入对应分类文件夹
@@ -38,6 +38,9 @@ Windows 桌面文件整理工具（Python + PySide6，独立自研）：
 ├── widgets.py         FileWidget 桌面格子窗口（图标、预览切换、位置记忆、暗色绘制）
 ├── control_panel.py   ControlPanel 控制面板（按钮、开关、搜索、暗色 QSS）
 ├── autostart.py       HKCU Run 键读写（纯 winreg，便于测试）
+├── layout_store.py    显示器身份 / 相对坐标 / 重叠消解（纯逻辑）
+├── instance_guard.py  QLockFile 单实例锁
+├── theme.py           瓷白纸感设计 token 与 QSS
 ├── search_service.py  收纳库搜索后台线程服务（面板与搜索格子共享）
 ├── assets\            app_icon.ico（快捷方式与打包 exe 共用）
 ├── tools\             make_readme_screenshots.py / make_app_icon.py / build_exe.py
@@ -1028,3 +1031,40 @@ python -m pytest tests/ -q    # 期望 143 passed
 - 203 → **214**：`tests/test_screen_clamp.py` 新增 8 例纯逻辑；
   `test_app_smoke.py` 新增 3 例（reclamp 写回 / 启动钳制 / 退出入口）；
   `test_rebuild_positions_are_stable` 改为"首轮钳制归一后逐轮稳定且全部在屏内"。
+
+## 30. v2.12.0 瓷白界面 / 显示器感知布局 / Win10 自启（2026-10-19）
+
+### 界面
+
+- 新增 `theme.py`：瓷白纸感、墨色文字、深青强调色；格子、控制面板、菜单、
+  弹窗与托盘图标共用同一套 token。
+- `ControlPanel` 改为左侧深色导航 + 右侧 `QStackedWidget` 四页：
+  整理 / 格子 / 设置 / 关于；原有控件 attribute 名保持不变，搜索、更新、
+  分类勾选、退出入口全部保留。
+- 格子标题栏增加左侧深青色条，紧凑列表行距与正文对比度同步调整。
+  背景采用直接绘制，不做离屏 `QPainter` 缓存（避免 PySide6/Windows 退出阶段
+  的堆损坏）。
+
+### 布局记忆（`layout_store.py`）
+
+- 配置新增 `widgetLayouts`：`{键: {x,y,w,h,screen,screenRect}}`，
+  同时保留旧 `widgetPositions/widgetSizes` 兼容旧版本。
+- 屏幕身份 = `QScreen.name()|model|serialNumber`；副屏暂未枚举时返回
+  `provisional`，格子临时显示但不写回配置，屏幕出现后自动回放。
+- 同一屏幕小幅可用区域变化（任务栏显隐）保留绝对坐标；明显分辨率变化才按
+  相对位置映射。
+- 启动时对超过较小窗口 40% 的重叠自动错开；退出/注销时保存布局。
+
+### 启动与性能
+
+- Run 项命令带 `--autostart`；登录后延迟 1.2 秒构建格子，启动时自动修正
+  过期路径；源码模式优先 `pythonw.exe`。
+- 新增 `instance_guard.py`：QLockFile 在创建窗口前抢占，避免登录时两个
+  启动项同时拉起。
+- 文件列表使用 `os.scandir` 单次遍历，构建时 `setUpdatesEnabled(False)`；
+  拖动/缩放复用屏幕矩形快照。
+
+### 测试
+
+- 全量 **236 passed**；新增 `test_layout_store.py`、`test_instance_guard.py`
+  及布局迁移/副屏缺失/重叠消解/自启参数回归用例。

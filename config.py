@@ -11,7 +11,7 @@ import sys
 from typing import Any, Dict, List
 
 # 应用版本号（语义化版本：主版本.次版本.修订号；与 README / CHANGELOG 同步更新）
-APP_VERSION = "2.11.0"
+APP_VERSION = "2.12.0"
 
 # 配置目录与文件路径常量
 CONFIG_DIR = os.path.join(

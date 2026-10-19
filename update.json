@@ -1,7 +1,7 @@
 {
-  "version": "2.11.0",
-  "url": "https://github.com/jokerXYH/desktop-organizer/releases/download/v2.11.0/desktop-organizer_v2.11.0.exe",
-  "sha256": "ea70fd58f6a938383721715765b93ae39367197c7f753c385d7c7de51b65fbdd",
+  "version": "2.12.0",
+  "url": "https://github.com/jokerXYH/desktop-organizer/releases/download/v2.12.0/desktop-organizer_v2.12.0.exe",
+  "sha256": "f48811408b7a3112124b714bbbff8b408c3062a27d4619c485d9b9b17a993978",
   "page": "https://github.com/jokerXYH/desktop-organizer/releases/latest",
-  "notes": "修复格子跑出屏幕：拖动/缩放加边界钳制，显示器变化自动收回，托盘新增「把所有格子移回屏幕内」；新增面板「退出助手」红色按钮（关窗≠退出），首次运行有托盘提示指引退出入口；面板加入顶栏与底栏操作区。"
+  "notes": "瓷白纸感界面重构：格子与控制面板换成更简约的纸感样式，面板改为左侧导航分页；布局记忆升级为显示器感知，副屏延迟出现也会回到原位置，历史重叠自动错开；Win10 开机自启带延迟恢复、路径自检与单实例锁；文件列表与拖动性能优化。"
 }
