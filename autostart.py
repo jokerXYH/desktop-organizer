@@ -65,23 +65,30 @@ def get_autostart_enabled() -> bool:
         return False
 
 
+def _open_run_key(access: int):
+    """打开（必要时创建）HKCU Run 键；用 CreateKeyEx 兼容极少数键被删的环境。"""
+    return winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0, access)
+
+
 def set_autostart(script_path: str, enable: bool,
                   extra_args=None) -> None:
-    """写入或删除 HKCU Run 自启项。
+    """写入或删除 HKCU Run 自启项，并在写入后回读校验。
 
-    :param script_path: 入口脚本绝对路径（写启用项时使用）
+    :param script_path: 入口脚本绝对路径（写启用项时使用；打包版传空串）
     :param enable: True=开启自启，False=关闭自启
+    :raises OSError: 注册表被策略/权限拒绝，或写入后回读不一致
     """
     if enable:
         command = build_autostart_command(
             sys.executable, script_path, extra_args or [AUTOSTART_ARG])
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH,
-                            0, winreg.KEY_SET_VALUE) as key:
+        with _open_run_key(winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE) as key:
             winreg.SetValueEx(key, VALUE_NAME, 0, winreg.REG_SZ, command)
+        # 回读校验：注册表被安全软件/组策略拦截时，SetValueEx 可能"成功"但值没落地
+        if not command_matches(get_autostart_command(), command):
+            raise OSError("自启项写入后回读不一致（可能被安全软件拦截）")
     else:
         try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH,
-                                0, winreg.KEY_SET_VALUE) as key:
+            with _open_run_key(winreg.KEY_SET_VALUE) as key:
                 winreg.DeleteValue(key, VALUE_NAME)
         except FileNotFoundError:
             pass  # 本来就没有自启项，视为成功
@@ -100,7 +107,6 @@ def sync_autostart(script_path: str) -> bool:
     current = get_autostart_command()
     if command_matches(current, expected):
         return False
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH,
-                        0, winreg.KEY_SET_VALUE) as key:
+    with _open_run_key(winreg.KEY_SET_VALUE) as key:
         winreg.SetValueEx(key, VALUE_NAME, 0, winreg.REG_SZ, expected)
     return True

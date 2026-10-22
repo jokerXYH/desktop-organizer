@@ -16,15 +16,16 @@ import uuid
 from ctypes import wintypes
 from datetime import datetime
 
-from PySide6.QtCore import (QAbstractNativeEventFilter, QFileSystemWatcher,
-                            QRect, Qt, QTimer)
+from PySide6.QtCore import (QAbstractNativeEventFilter,
+                            QFileSystemWatcher, QRect, Qt, QTimer)
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtWidgets import (QApplication, QFileDialog, QInputDialog,
-                               QMenu, QMessageBox, QSystemTrayIcon)
+from PySide6.QtWidgets import (QApplication, QFileDialog, QInputDialog, QMenu,
+                               QMessageBox, QSystemTrayIcon)
 
 import autostart
 import config as cfg
+import crash_guard
 import instance_guard
 import layout_store
 import organizer as org
@@ -32,6 +33,7 @@ import shell_menu
 import shortcut
 import theme
 import updater
+import win_compat
 from control_panel import ControlPanel
 from search_service import SearchService
 from widgets import (BUILTIN_GRID_NAMES, SEARCH_GRID_TITLE, WIDGET_GAP,
@@ -100,15 +102,22 @@ def notify_running_instance(message: bytes = b"show") -> bool:
 
     消息含义：b"show" = 显示控制面板（默认）；b"organize" = 执行一键整理
     （桌面右键菜单进入时使用，见 cli_action）。
+
+    登录瞬间两个启动项同时拉起时，第一个实例可能还没完成 listen。这里做
+    几次短重试，避免第二个进程"既没抢到锁、又没唤起旧实例"后静默退出。
     """
-    socket = QLocalSocket()
-    socket.connectToServer(SINGLE_INSTANCE_KEY)
-    if not socket.waitForConnected(300):
-        return False
-    socket.write(message)
-    socket.waitForBytesWritten(300)
-    socket.disconnectFromServer()
-    return True
+    for attempt in range(5):
+        socket = QLocalSocket()
+        socket.connectToServer(SINGLE_INSTANCE_KEY)
+        if socket.waitForConnected(300):
+            socket.write(message)
+            socket.waitForBytesWritten(300)
+            socket.disconnectFromServer()
+            return True
+        socket.abort()
+        if attempt < 4:
+            time.sleep(0.15)
+    return False
 
 
 def cli_action(argv) -> str:
@@ -222,13 +231,21 @@ class AppContext:
             return list(self.config.get("gridPaths", {}).items())
 
     def ensure_storage_dirs(self):
-        """确保收纳根目录及各分类子目录存在（路径映射的格子除外）。"""
+        """确保收纳根目录及各分类子目录存在（路径映射的格子除外）。
+
+        单个目录创建失败（U 盘拔出、盘符不可用、权限不足）只跳过该目录，
+        不能让整次重建/启动失败。
+        """
         root = self.config["storageRoot"]
         mapped = self.config.get("gridPaths", {})
         for name in self.config.get("categories", []):
             if name in mapped:
                 continue
-            os.makedirs(os.path.join(root, name), exist_ok=True)
+            try:
+                os.makedirs(os.path.join(root, name), exist_ok=True)
+            except OSError as exc:
+                crash_guard.log_message(
+                    f"创建收纳目录失败 {name}: {exc}", "WARN")
 
     def rebuild_widgets(self):
         """按当前配置重建全部桌面格子。
@@ -242,7 +259,8 @@ class AppContext:
         self.ensure_storage_dirs()
 
         root = self.config["storageRoot"]
-        screen = QApplication.primaryScreen().availableGeometry()
+        primary = QApplication.primaryScreen()
+        screen = primary.availableGeometry() if primary is not None else QRect(0, 0, 1280, 800)
         screens = QApplication.screens()
         positions = self.config.setdefault("widgetPositions", {})
         layouts = self.config.setdefault("widgetLayouts", {})
@@ -969,11 +987,19 @@ class AppContext:
     # ---------- 开机自启 ----------
 
     def set_autostart(self, enabled: bool):
-        """写入/删除注册表自启项并记录到配置。"""
+        """写入/删除注册表自启项并记录到配置。
+
+        注册表是自启的唯一真源；配置写入失败只记日志，不能反过来让
+        已经写好的注册表项被误报为失败（否则 UI 会回滚勾选、状态不一致）。
+        """
         autostart.set_autostart(
             SCRIPT_PATH, enabled, extra_args=[autostart.AUTOSTART_ARG])
         self.config["autostart"] = enabled
-        cfg.save_config(self.config)
+        try:
+            cfg.save_config(self.config)
+        except OSError as exc:
+            crash_guard.log_message(f"保存自启配置失败：{exc}", "WARN")
+        crash_guard.log_message(f"开机自启已{'开启' if enabled else '关闭'}")
 
     def set_shell_menu(self, enabled: bool):
         """添加/移除桌面右键菜单项（HKCU 注册表；失败抛 OSError 由面板提示）。"""
@@ -1395,7 +1421,8 @@ class AppContext:
         return failed
 
     def show_panel(self):
-        """显示并激活控制面板。"""
+        """显示并激活控制面板（最小化时先还原，F8/托盘唤起才可靠）。"""
+        self.panel.showNormal()
         self.panel.show()
         self.panel.raise_()
         self.panel.activateWindow()
@@ -1413,6 +1440,11 @@ class AppContext:
 
 def main():
     """程序入口：初始化 Qt 应用、注册热键、构建托盘与格子。"""
+    # 第一步就装崩溃日志：后面任何一步（配置、图形驱动、自启）出问题都能留痕。
+    crash_guard.install()
+    # 任务栏/通知归属 ID 必须在创建 QApplication 与任何窗口前设置。
+    win_compat.set_app_user_model_id()
+
     # 自更新接力：新版本 exe 先等旧进程退出、清理 *.old，随后正常启动
     # （apply_update 会把旧 exe 改名为 *.old 再放新文件，见 updater.py）
     wait_pid = update_wait_pid(sys.argv)
@@ -1432,18 +1464,31 @@ def main():
     instance_lock = instance_guard.acquire(
         os.path.join(cfg.CONFIG_DIR, "app.lock"))
     if instance_lock is None:
-        notify_running_instance(
+        notified = notify_running_instance(
             b"organize" if action == "organize" else b"show")
+        crash_guard.log_message(
+            f"已有实例运行，唤醒{'成功' if notified else '失败（旧实例可能仍在启动）'}",
+            "WARN" if not notified else "INFO")
         return
 
     # 已开启自启时自动修正过期路径，并补上 --autostart 参数。
     try:
-        autostart.sync_autostart(SCRIPT_PATH)
-    except OSError:
-        pass
+        if autostart.sync_autostart(SCRIPT_PATH):
+            crash_guard.log_message("已修正过期的开机自启路径")
+    except Exception as exc:
+        crash_guard.log_message(f"自启路径同步失败：{exc}", "WARN")
 
     is_autostart = autostart.AUTOSTART_ARG in sys.argv
-    ctx = AppContext()
+    try:
+        ctx = AppContext()
+    except Exception:
+        crash_guard.log_exception("AppContext 初始化失败")
+        QMessageBox.critical(
+            None, "桌面分类助手启动失败",
+            "初始化时发生错误，已写入日志：\n"
+            f"{crash_guard.log_path()}\n\n"
+            "请把该日志发给开发者，或删除配置目录后重试。")
+        return
 
     # 单实例服务：接收后续启动实例的"唤起"请求
     server = QLocalServer(app)
@@ -1502,7 +1547,12 @@ def main():
                 (HOTKEY_F7, VK_F7, "F7 显示/隐藏格子", ctx.toggle_widgets),
                 (HOTKEY_F8, VK_F8, "F8 控制面板", ctx.show_panel),
                 (HOTKEY_F9, VK_F9, "F9 游戏模式", ctx.toggle_game_mode)):
-            if ctypes.windll.user32.RegisterHotKey(None, hk_id, MOD_NOREPEAT, vk):
+            try:
+                registered = bool(ctypes.windll.user32.RegisterHotKey(
+                    None, hk_id, MOD_NOREPEAT, vk))
+            except Exception:
+                registered = False
+            if registered:
                 hotkeys_ok[hk_id] = callback
             else:
                 hotkeys_failed.append(label)
@@ -1574,7 +1624,16 @@ def main():
 
     def _start_widgets():
         """构建格子并恢复状态；自启模式下不主动弹控制面板。"""
-        ctx.rebuild_widgets()
+        try:
+            ctx.rebuild_widgets()
+        except Exception:
+            crash_guard.log_exception("构建桌面格子失败")
+            if ctx.tray is not None:
+                ctx.tray.showMessage(
+                    "桌面格子加载失败",
+                    f"详情已写入日志：{crash_guard.log_path()}",
+                    QSystemTrayIcon.Warning, 6000)
+            return
         if ctx.config.get("gameMode", False):
             ctx.set_game_mode(True, notify=False)   # 启动恢复不重复弹提示
         elif not is_autostart:
@@ -1585,21 +1644,33 @@ def main():
             QTimer.singleShot(120, ctx.organize_now)
 
     # Win10 登录后显示器枚举可能晚于 Run 项：自启时稍等桌面就绪，
-    # 避免副屏尚未出现就把格子临时落在主屏。
+    # 避免副屏尚未出现就把格子临时落在主屏。2 秒是 Explorer 任务栏/托盘
+    # 基本就绪的保守值；屏幕就绪后 _screen_settle_timer 还会再校准一次。
     if is_autostart:
-        QTimer.singleShot(1200, _start_widgets)
+        QTimer.singleShot(2000, _start_widgets)
     else:
         _start_widgets()
 
-    app.aboutToQuit.connect(ctx.save_all_positions)
+    def _safe_save_positions():
+        """退出/关机落盘：配置目录不可写时只记日志，不让退出流程崩溃。"""
+        try:
+            ctx.save_all_positions()
+        except Exception:
+            crash_guard.log_exception("保存格子布局失败")
+
+    app.aboutToQuit.connect(_safe_save_positions)
     # Windows 注销/关机时先保存一次布局（不是所有关机都会走 aboutToQuit）。
     commit_signal = getattr(app, "commitDataRequest", None)
     if commit_signal is not None:
-        commit_signal.connect(lambda _manager: ctx.save_all_positions())
+        commit_signal.connect(lambda _manager: _safe_save_positions())
     exit_code = app.exec()
     instance_lock.unlock()
     for hk_id in hotkeys_ok:
-        ctypes.windll.user32.UnregisterHotKey(None, hk_id)
+        try:
+            ctypes.windll.user32.UnregisterHotKey(None, hk_id)
+        except Exception:
+            pass
+    crash_guard.log_message("正常退出")
     sys.exit(exit_code)
 
 

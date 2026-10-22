@@ -25,6 +25,69 @@ def test_load_config_corrupt_file_returns_default(tmp_path, monkeypatch):
     assert cfg.load_config() == cfg.DEFAULT_CONFIG
 
 
+def test_load_config_recovers_from_backup(tmp_path, monkeypatch):
+    """主配置损坏而 .bak 完好时，应从备份恢复而不是丢掉全部设置。"""
+    main = tmp_path / "s.json"
+    main.write_text("{broken", encoding="utf-8")
+    (tmp_path / "s.json.bak").write_text(
+        '{"widgetPositions": {}, "storageRoot": "E:/backup-root",'
+        ' "categories": ["文档"]}', encoding="utf-8")
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(main))
+    monkeypatch.setattr(cfg, "HISTORY_PATH", str(tmp_path / "h.json"))
+
+    data = cfg.load_config()
+
+    assert data["storageRoot"] == "E:/backup-root"
+    assert data["categories"] == ["文档"]
+
+
+def test_load_config_sanitizes_bad_types(tmp_path, monkeypatch):
+    """被手改坏的字段只回退该字段，不能让错误类型进入运行期。"""
+    path = tmp_path / "s.json"
+    path.write_text(
+        '{"storageRoot": 123, "categories": "文档", "includeFolders": "yes",'
+        ' "autoOrganizeDelay": -9, "widgetSizes": [1, 2],'
+        ' "widgetPositions": {"文档": "1,2"}}', encoding="utf-8")
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(path))
+    monkeypatch.setattr(cfg, "HISTORY_PATH", str(tmp_path / "h.json"))
+
+    data = cfg.load_config()
+
+    assert data["storageRoot"] == cfg.DEFAULT_CONFIG["storageRoot"]
+    assert isinstance(data["categories"], list)
+    assert data["includeFolders"] is cfg.DEFAULT_CONFIG["includeFolders"]
+    assert data["autoOrganizeDelay"] == 0
+    assert data["widgetSizes"] == {}
+    assert data["widgetPositions"] == {"文档": "1,2"}
+
+
+def test_save_config_keeps_previous_backup(tmp_path, monkeypatch):
+    """第二次保存时旧配置应轮换为 .bak，供损坏时恢复。"""
+    path = tmp_path / "s.json"
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(path))
+    monkeypatch.setattr(cfg, "HISTORY_PATH", str(tmp_path / "h.json"))
+    cfg.save_config(dict(cfg.DEFAULT_CONFIG, storageRoot="E:/one"))
+    cfg.save_config(dict(cfg.DEFAULT_CONFIG, storageRoot="E:/two"))
+
+    import json
+    backup = json.loads((tmp_path / "s.json.bak").read_text(encoding="utf-8"))
+    assert backup["storageRoot"] == "E:/one"
+    assert json.loads(path.read_text(encoding="utf-8"))["storageRoot"] == "E:/two"
+
+
+def test_load_history_recovers_from_backup(tmp_path, monkeypatch):
+    """历史主文件损坏时从 .bak 读取，撤销记录不至于全丢。"""
+    main = tmp_path / "h.json"
+    main.write_text("[broken", encoding="utf-8")
+    (tmp_path / "h.json.bak").write_text(
+        '[{"src": "a", "dst": "b", "batch": "b1"}]', encoding="utf-8")
+    monkeypatch.setattr(cfg, "HISTORY_PATH", str(main))
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "s.json"))
+
+    assert cfg.load_history() == [{"src": "a", "dst": "b", "batch": "b1"}]
+
+
+
 def test_config_roundtrip(tmp_path, monkeypatch):
     """保存后读取应得到相同内容。"""
     monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "s.json"))

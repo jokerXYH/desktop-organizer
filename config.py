@@ -74,23 +74,79 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 # 用于识别 v1 旧配置的键：旧配置文件里没有它，加载时补"文件夹"分类
 V2_MARKER_KEY = "widgetPositions"
 
+# 配置值的类型白名单：损坏/被手改坏的字段回退默认值，避免带着错误类型启动
+# 后在 UI 线程里抛异常（例如 categories 变成字符串、widgetSizes 变成列表）。
+_BOOL_KEYS = {"includeShortcuts", "includeFolders", "autostart", "shellMenu",
+              "previewIcons", "gameMode", "autoOrganize", "searchGrid",
+              "confirmOrganize", "trayTipShown"}
+_INT_KEYS = {"autoOrganizeDelay"}
+_STR_KEYS = {"storageRoot", "updateUrl", "panelGeometry"}
+_DICT_KEYS = {"widgetPositions", "widgetLayouts", "widgetSizes",
+              "widgetScales", "widgetPreviews", "widgetCollapsed",
+              "gridPaths", "gridTitles"}
+
+
+def _sanitize_config(data: Dict[str, Any]) -> Dict[str, Any]:
+    """过滤配置中的非法类型，只保留能安全使用的字段（返回新字典）。
+
+    坏配置比缺配置更危险：`categories` 若是字符串，启动时会按字符创建格子；
+    `widgetSizes` 若是列表，取尺寸时会抛 TypeError。这里统一做类型归一，
+    单个字段坏掉只丢该字段，不影响其余设置。
+    """
+    clean: Dict[str, Any] = {}
+    for key, value in data.items():
+        if key in _BOOL_KEYS:
+            if isinstance(value, bool):
+                clean[key] = value
+        elif key in _INT_KEYS:
+            if isinstance(value, int) and not isinstance(value, bool):
+                clean[key] = max(0, min(86400, value))
+        elif key in _STR_KEYS:
+            if isinstance(value, str):
+                clean[key] = value
+        elif key in _DICT_KEYS:
+            if isinstance(value, dict):
+                clean[key] = value
+        elif key == "categories":
+            if isinstance(value, list):
+                cats, seen = [], set()
+                for item in value:
+                    name = str(item).strip() if isinstance(item, str) else ""
+                    if name and name not in seen:
+                        seen.add(name)
+                        cats.append(name)
+                if cats:
+                    clean[key] = cats
+        else:
+            clean[key] = value          # 未知键原样保留，向后兼容
+    if "storageRoot" in clean and not clean["storageRoot"].strip():
+        clean.pop("storageRoot")        # 空字符串回退默认收纳目录
+    return clean
+
+
+def _read_json(path: str):
+    """读取 JSON 文件；不存在/损坏/权限不足时返回 None（不抛异常）。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
 
 def load_config() -> Dict[str, Any]:
-    """读取配置；文件不存在或损坏时返回默认配置的拷贝。
+    """读取配置；文件损坏时先尝试 .bak 备份，再退回默认配置。
 
     兼容 v1 旧配置：文件中没有 V2_MARKER_KEY 时视为旧版，
     自动在 categories 末尾补上"文件夹"分类。
     """
     merged = copy.deepcopy(DEFAULT_CONFIG)
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            merged.update(data)
-            if V2_MARKER_KEY not in data and isinstance(merged["categories"], list):
-                merged["categories"] = ensure_folder_category(merged["categories"])
-    except (OSError, ValueError):
-        pass
+    data = _read_json(CONFIG_PATH)
+    if not isinstance(data, dict):
+        data = _read_json(CONFIG_PATH + ".bak")   # 原子写入留下的上一份好配置
+    if isinstance(data, dict):
+        merged.update(_sanitize_config(data))
+        if V2_MARKER_KEY not in data and isinstance(merged["categories"], list):
+            merged["categories"] = ensure_folder_category(merged["categories"])
     return merged
 
 
@@ -165,17 +221,41 @@ def retarget_history_prefix(old_prefix: str, new_prefix: str) -> int:
 
 
 def _atomic_write(path: str, data: str) -> None:
-    """原子写文件：先写临时文件再 os.replace 替换。
+    """原子写文件：先写临时文件，再把旧文件轮换为 .bak，最后 os.replace。
 
     直接 truncate 原文件再写的写法在崩溃/断电瞬间会产生损坏的半截 JSON，
-    导致下次启动静默丢失格子位置与撤销历史。os.replace 在同分区上是原子的，
-    任何时刻磁盘上的正式文件要么是完整旧版、要么是完整新版。
+    导致下次启动静默丢失格子位置与撤销历史。这里的顺序保证：
+
+    1. 新内容先完整落到 .tmp；
+    2. 旧文件原子改名为 .bak（留下上一份可用的好配置）；
+    3. .tmp 原子替换正式文件。
+
+    第 3 步失败时把 .bak 改回原名，磁盘上仍是完整旧版；任何时刻都不会
+    出现"正式文件只写了一半"的状态。.bak 只保留一份，空间开销可忽略。
     """
     tmp = path + ".tmp"
+    bak = path + ".bak"
+    backed_up = False
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(data)
-        os.replace(tmp, path)
+            f.flush()
+            os.fsync(f.fileno())          # 断电前确保内容真正落盘
+        if os.path.exists(path) and _read_json(path) is not None:
+            try:
+                os.replace(path, bak)     # 旧文件 -> 备份（同分区原子）
+                backed_up = True
+            except OSError:
+                backed_up = False         # 备份失败不阻塞保存，继续替换
+        try:
+            os.replace(tmp, path)
+        except OSError:
+            if backed_up:
+                try:
+                    os.replace(bak, path)  # 替换失败：把旧文件放回去
+                except OSError:
+                    pass
+            raise
     finally:
         if os.path.exists(tmp):          # 写入/替换失败残留的临时文件
             try:
@@ -192,13 +272,11 @@ def save_config(config: Dict[str, Any]) -> None:
 
 
 def load_history() -> List[dict]:
-    """读取全部移动历史记录；文件损坏时返回空列表。"""
-    try:
-        with open(HISTORY_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
-    except (OSError, ValueError):
-        return []
+    """读取全部移动历史记录；文件损坏时尝试 .bak，仍失败返回空列表。"""
+    data = _read_json(HISTORY_PATH)
+    if not isinstance(data, list):
+        data = _read_json(HISTORY_PATH + ".bak")
+    return data if isinstance(data, list) else []
 
 
 def save_history(records: List[dict]) -> None:

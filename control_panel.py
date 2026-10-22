@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox,
 
 import autostart
 import config as cfg
+import crash_guard
 import organizer as org
 import shell_menu
 import theme
@@ -38,7 +39,7 @@ PANEL_QSS = theme.PANEL_QSS
 
 
 class GlassCheckBox(QCheckBox):
-    """玻璃拟态勾选框：自绘圆角指示器（选中=钢灰填充 + 深色对勾）。
+    """玻璃拟态勾选框：自绘圆角指示器（选中=冷灰青填充 + 深色对勾）。
 
     为什么不用 QSS 直接改 ::indicator：QSS 只能替换指示器的底色/边框，
     画不出对勾（对勾需要外部图片资源）；为免引入图片依赖，这里用一个
@@ -60,11 +61,11 @@ class GlassCheckBox(QCheckBox):
         rect = QRectF(0, (self.height() - box) / 2, box, box)
         hovered = self.underMouse()
 
-        if self.isChecked():                    # 选中：钢灰圆角块 + 深色对勾
+        if self.isChecked():                    # 选中：冷灰青圆角块 + 深色对勾
             painter.setPen(Qt.NoPen)
             painter.setBrush(QColor(COLOR_ACCENT))
             painter.drawRoundedRect(rect, 5, 5)
-            pen = QPen(QColor("#14171b"), 2)
+            pen = QPen(QColor("#08110D"), 2)
             pen.setCapStyle(Qt.RoundCap)
             pen.setJoinStyle(Qt.RoundJoin)
             painter.setPen(pen)
@@ -76,8 +77,8 @@ class GlassCheckBox(QCheckBox):
             ])
         else:                                   # 未选中：半透明玻璃小方块，悬停时提亮
             painter.setPen(QPen(
-                QColor(31, 35, 39, 120 if hovered else 76), 1))
-            painter.setBrush(QColor(31, 35, 39, 12))
+                QColor(230, 237, 241, 130 if hovered else 80), 1))
+            painter.setBrush(QColor(255, 255, 255, 12))
             painter.drawRoundedRect(rect, 5, 5)
 
         painter.setPen(QColor(COLOR_TEXT))
@@ -198,10 +199,15 @@ class ControlPanel(QWidget):
         super().__init__()
         self.ctx = ctx
         self.setWindowTitle(f"桌面分类助手 v{cfg.APP_VERSION} - 控制面板")
-        # 宽高都按屏幕可用空间钳制（小屏笔记本不会被截断）
-        screen = QApplication.primaryScreen().availableGeometry()
-        self.resize(min(PANEL_WIDTH, screen.width() - 40),
-                    min(PANEL_HEIGHT, screen.height() - 80))
+        # 控制面板保持原生边框与不透明深色背景：稳定、可缩放、可最小化；
+        # 桌面格子才是半透明玻璃（见 widgets.FileWidget）。
+        self.setObjectName("panel")
+        self.setMinimumSize(480, 360)
+        # 宽高都按屏幕可用空间钳制（小屏笔记本不会被截断；无显示器时用兜底尺寸）
+        screen = QApplication.primaryScreen()
+        available = screen.availableGeometry() if screen is not None else QRect(0, 0, 1280, 800)
+        self.resize(min(PANEL_WIDTH, available.width() - 40),
+                    min(PANEL_HEIGHT, available.height() - 80))
         self.setStyleSheet(PANEL_QSS)
         self._restore_geometry()          # 恢复上次关闭时的面板位置与大小
 
@@ -213,10 +219,11 @@ class ControlPanel(QWidget):
         page = QWidget()
         page.setObjectName("page")
         page_layout = QVBoxLayout(page)
-        page_layout.setContentsMargins(30, 26, 30, 18)
+        page_layout.setContentsMargins(30, 24, 30, 18)
         page_layout.setSpacing(18)
 
         header = QHBoxLayout()
+        header.setSpacing(8)
         title_block = QVBoxLayout()
         title_block.setSpacing(3)
         self.page_title_label = QLabel()
@@ -253,6 +260,10 @@ class ControlPanel(QWidget):
         self.open_config_btn.clicked.connect(
             lambda: open_in_shell(cfg.CONFIG_DIR))
         footer.addWidget(self.open_config_btn)
+        self.log_btn = QPushButton("日志")
+        self.log_btn.setToolTip("打开崩溃/异常日志目录（排查问题时发给开发者）")
+        self.log_btn.clicked.connect(self._open_logs)
+        footer.addWidget(self.log_btn)
         self.about_btn = QPushButton("关于")
         self.about_btn.setToolTip("详情介绍 / 更新日志 / 免责声明")
         self.about_btn.clicked.connect(self._show_about)
@@ -828,6 +839,15 @@ class ControlPanel(QWidget):
         else:
             self.ctx.refresh_status("收纳目录不存在，请检查上方「收纳目录」设置")
 
+    def _open_logs(self):
+        """打开日志目录（不存在则创建），方便用户反馈崩溃现场。"""
+        try:
+            path = os.path.join(cfg.CONFIG_DIR, "logs")
+            os.makedirs(path, exist_ok=True)
+            open_in_shell(path)
+        except OSError as exc:
+            QMessageBox.warning(self, "无法打开日志目录", str(exc))
+
     def _request_quit(self):
         """面板「退出助手」：确认后退出程序（AppContext 统一收尾并保存状态）。"""
         answer = QMessageBox.question(
@@ -1038,15 +1058,21 @@ class ControlPanel(QWidget):
         横向改版后旧几何（宽 480）不再适配：宽度 < 800 的历史记忆直接忽略、
         居中显示新默认尺寸；恢复的尺寸同样按屏幕钳制（换到小屏显示器不会超界）。
         """
-        screen = QApplication.primaryScreen().availableGeometry()
+        screen = QApplication.primaryScreen()
+        available = screen.availableGeometry() if screen is not None else QRect(0, 0, 1280, 800)
         saved = cfg.parse_geometry(self.ctx.config.get("panelGeometry", ""))
         if saved and saved[2] >= 800 and self.ctx._position_visible(*saved):
-            width = max(600, min(int(saved[2]), screen.width() - 40))
-            height = max(420, min(int(saved[3]), screen.height() - 80))
+            width = max(600, min(int(saved[2]), available.width() - 40))
+            height = max(420, min(int(saved[3]), available.height() - 80))
+            # 高 DPI / 换屏后旧的左上角坐标可能让右/下缘越界：整体收进屏幕内
+            x = min(max(int(saved[0]), available.x()),
+                    available.x() + available.width() - width)
+            y = min(max(int(saved[1]), available.y()),
+                    available.y() + available.height() - height)
             self.resize(width, height)
-            self.move(saved[0], saved[1])
+            self.move(x, y)
             return
-        self.move(screen.center() - self.rect().center())
+        self.move(available.center() - self.rect().center())
 
     def save_geometry(self):
         """把面板当前位置与大小写入配置（关闭/退出时调用）。"""

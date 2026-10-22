@@ -11,6 +11,7 @@
 - 窗口拖动结束后通过防抖回调上报位置，实现"格子位置记忆"
 """
 import os
+import stat
 import subprocess
 import threading
 import weakref
@@ -19,13 +20,14 @@ from PySide6.QtCore import (QFileInfo, QMimeData, QObject, QPoint, QRect, QRectF
                             QRunnable, QSize, QThreadPool, Qt, QTimer, QUrl,
                             Signal)
 from PySide6.QtGui import (QAction, QActionGroup, QBrush, QColor, QFont,
-                           QIcon, QImage, QImageReader, QLinearGradient,
-                           QPainter, QPainterPath, QPen, QPixmap)
+                           QFontMetrics, QIcon, QImage, QImageReader,
+                           QLinearGradient, QPainter, QPainterPath, QPen,
+                           QPixmap)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication,
                                QFileIconProvider, QHBoxLayout, QInputDialog,
                                QLabel, QLineEdit, QListWidget, QListWidgetItem,
-                               QListView, QMenu, QMessageBox, QVBoxLayout,
-                               QWidget)
+                               QListView, QMenu, QMessageBox, QStyle,
+                               QStyledItemDelegate, QVBoxLayout, QWidget)
 
 from organizer import (CATEGORY_RULES, FOLDER_CATEGORY, move_to_recycle_bin,
                        rename_entry)
@@ -39,7 +41,7 @@ TITLE_BAR_HEIGHT = 42     # 标题栏高度
 COLLAPSED_HEIGHT = TITLE_BAR_HEIGHT + 8   # 收起形态总高度：只剩标题行 + 上下边距
 ICON_SIZE = 38            # 图标模式下文件图标的边长（像素）
 GRID_CELL_W = 76          # 图标模式网格单元宽（保证每行 3 列排满）
-GRID_CELL_H = 84          # 图标模式网格单元高
+GRID_TEXT_LINES = 3       # 图标模式下文件名最多显示几行（超出才用省略号）
 COMPACT_ICON_PX = 24      # 紧凑列表左侧图标/缩略图的边长（比原 16px 更能看出图片内容）
 
 # 桌面搜索格子：扁平搜索条——平时只有"搜索框高度"，有结果时才向下展开显示结果
@@ -106,6 +108,21 @@ _ICON_PROVIDER = None
 
 # 文件图标缓存：{(路径, mtime): QIcon}，避免每次刷新重复做白页检测与 Shell 兜底
 _FILE_ICON_CACHE = {}
+
+
+def entry_recency_ns(info) -> int:
+    """返回条目的"新近程度"时间戳（纳秒），用于格子内排序。
+
+    取 mtime 与 ctime 的较大值：
+    - Windows 上 st_ctime 是创建时间；文件从桌面（C:）移入收纳库（D:）属于
+      跨盘复制，创建时间就是"放进格子的时间"，因此新放入的文件一定排在最前。
+    - 同盘移动会保留旧创建时间，此时用 mtime 兜底；刚改过的文件也会排前。
+    两个时间都取不到（stat 失败）时返回 0，让它排到最后。
+    """
+    try:
+        return max(int(info.st_mtime_ns), int(info.st_ctime_ns))
+    except (AttributeError, OSError, ValueError):
+        return 0
 
 
 def get_icon_provider() -> QFileIconProvider:
@@ -230,14 +247,22 @@ def shell_fallback_icon(path: str):
         user32.DestroyIcon(hicon)
 
 
-def open_in_shell(path: str) -> None:
-    """用系统默认方式打开文件或文件夹（跨平台封装）。"""
-    if os.name == "nt":
-        os.startfile(path)
-    elif sys_darwin():
-        subprocess.call(["open", path])
-    else:
-        subprocess.call(["xdg-open", path])
+def open_in_shell(path: str) -> bool:
+    """用系统默认方式打开文件或文件夹；失败返回 False（不向上抛异常）。
+
+    路径可能刚被外部程序删除、U 盘被拔出、或没有关联程序；这些都属于
+    "用户操作落空"，不应该变成未捕获异常把托盘程序带崩。
+    """
+    try:
+        if os.name == "nt":
+            os.startfile(path)
+        elif sys_darwin():
+            subprocess.call(["open", path])
+        else:
+            subprocess.call(["xdg-open", path])
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def _icon_stats(icon, size: int = 38):
@@ -454,21 +479,26 @@ def get_thumbnail_service() -> ThumbnailService:
 def scale_geometry(scale: float) -> dict:
     """按缩放比计算格子的几何参数（窗口/图标/网格单元/字号）。
 
-    基准（scale=1.0）：窗口 270x360、图标 38px、网格单元 76x84、标题 11pt、条目 9pt；
-    超出档位范围自动钳制。数值关系与排版在桌面实机上验证过（每行 3 列排满）。
+    基准（scale=1.0）：窗口 270x360、图标 38px、网格单元 76x97、标题 11pt、条目 9pt；
+    超出档位范围自动钳制。单元格高度按"图标 + 3 行文件名"计算：以前固定
+    icon+46，只够两行多，第三行会被裁掉半截（图标模式显示不全的根因）。
     """
     s = max(SCALE_MIN, min(SCALE_MAX, float(scale)))
     icon = max(24, min(56, round(ICON_SIZE * s)))
+    item_pt = max(8, min(12, round(9 * s)))
+    # 微软雅黑 UI 的行距约为字号的 1.65 倍（9pt≈15px、12pt≈20px）
+    line_h = max(11, round(item_pt * 1.65))
     return {
         "scale": s,
         "width": round(WIDGET_WIDTH * s),
         "height": round(WIDGET_HEIGHT * s),
         "icon": icon,
         "cell_w": max(58, round(GRID_CELL_W * s)),
-        "cell_h": icon + 46,                          # 图标 + 两行文字与内边距
+        # 图标 + 上下内边距 + 图标与文字间距 + 完整的三行文件名
+        "cell_h": icon + 14 + GRID_TEXT_LINES * line_h,
         "title_pt": max(9, min(15, round(11 * s))),
         "small_pt": max(7, min(10, round(8 * s))),
-        "item_pt": max(8, min(12, round(9 * s))),
+        "item_pt": item_pt,
         "open_pt": max(8, min(12, round(9 * s))),
     }
 
@@ -647,6 +677,111 @@ def plan_default_placement(rects, size, screen, gap: int = WIDGET_GAP,
             return QPoint(scan_x, scan_y)
         scan_y = max(r.y() + r.height() for r in blocked) + gap
     return QPoint(scan_x, scan_y)
+
+
+def wrap_icon_label(text: str, metrics, width: int,
+                    max_lines: int = GRID_TEXT_LINES) -> list:
+    """把文件名按像素宽度折成最多 max_lines 行，最后一行为超长时补省略号。
+
+    Qt 自带的图标委托只会按单元格高度硬裁：名字一长就出现"半截字"。
+    这里先按宽度逐字折行，再在最后一行留出省略号的位置，保证任何文件名
+    都只占整数行、不会被切掉半个字。
+    """
+    text = (text or "").strip()
+    width = int(width)
+    if not text or width <= 0 or max_lines <= 0:
+        return []
+    ellipsis = "…"
+    lines = []
+    rest = text
+    for index in range(max_lines):
+        last = index == max_lines - 1
+        limit = width - (metrics.horizontalAdvance(ellipsis) if last else 0)
+        limit = max(1, limit)
+        if metrics.horizontalAdvance(rest) <= limit:
+            lines.append(rest)
+            return lines
+        # 二分查找当前行能放下的最长前缀
+        low, high = 1, len(rest)
+        while low < high:
+            mid = (low + high + 1) // 2
+            if metrics.horizontalAdvance(rest[:mid]) <= limit:
+                low = mid
+            else:
+                high = mid - 1
+        cut = max(1, low)
+        # 尽量在空格/连字符处断行，避免把英文单词从中间劈开
+        window = rest[:cut]
+        for sep in (" ", "-", "_", "·", "&", "+"):
+            pos = window.rfind(sep)
+            if pos >= max(1, cut // 2):
+                cut = pos + 1
+                break
+        chunk = rest[:cut].rstrip()
+        rest = rest[cut:].lstrip()
+        if last:
+            lines.append(chunk + ellipsis)
+            return lines
+        lines.append(chunk)
+    return lines
+
+
+class IconGridDelegate(QStyledItemDelegate):
+    """图标视图委托：图标居上、文件名最多三行且自动省略，不再裁掉半行字。"""
+
+    def __init__(self, icon_px: int = ICON_SIZE,
+                 max_lines: int = GRID_TEXT_LINES, parent=None):
+        super().__init__(parent)
+        self.icon_px = int(icon_px)
+        self.max_lines = int(max_lines)
+
+    def set_metrics(self, icon_px: int, max_lines: int = GRID_TEXT_LINES):
+        """跟随 Ctrl+滚轮缩放更新图标尺寸与最大行数。"""
+        self.icon_px = int(icon_px)
+        self.max_lines = int(max_lines)
+
+    def paint(self, painter, option, index):
+        rect = option.rect.adjusted(3, 3, -3, -3)
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+
+        # 背景/选中/悬停：QSS 的 ::item 规则由默认委托绘制，但默认委托会顺带
+        # 重画被硬裁的文字（QStyledItemDelegate::paint 会重新读取 index 文本），
+        # 所以这里自己画圆角底色，文字与图标完全由本委托控制。
+        selected = bool(option.state & QStyle.State_Selected)
+        hovered = bool(option.state & QStyle.State_MouseOver)
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        if selected:
+            painter.setPen(QPen(QColor(127, 179, 164, 96), 1))
+            painter.setBrush(QColor(127, 179, 164, 38))
+            painter.drawRoundedRect(option.rect.adjusted(1, 1, -1, -1), 10, 10)
+        elif hovered:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(255, 255, 255, 14))
+            painter.drawRoundedRect(option.rect.adjusted(1, 1, -1, -1), 10, 10)
+
+        metrics = QFontMetrics(option.font)
+        icon_px = max(0, min(self.icon_px, rect.width(),
+                             rect.height() - metrics.lineSpacing()))
+        icon = index.data(Qt.DecorationRole)
+        icon_rect = QRect(rect.x(), rect.y() + 1, rect.width(), icon_px)
+        if icon is not None:
+            icon.paint(painter, icon_rect, Qt.AlignHCenter | Qt.AlignTop)
+
+        painter.setFont(option.font)
+        painter.setPen(QColor("#F2F8F5") if selected else QColor(COLOR_TEXT))
+        line_h = metrics.lineSpacing()
+        y = icon_rect.bottom() + 5
+        lines = wrap_icon_label(str(index.data(Qt.DisplayRole) or ""),
+                                metrics, rect.width(), self.max_lines)
+        for line in lines:
+            if y + line_h > option.rect.bottom() + 1:
+                break
+            painter.drawText(QRect(rect.x(), y, rect.width(), line_h),
+                             Qt.AlignHCenter | Qt.AlignVCenter, line)
+            y += line_h
+        painter.restore()
 
 
 class FileListWidget(QListWidget):
@@ -846,6 +981,8 @@ class FileWidget(QWidget):
         self._collapsed = False        # 收起状态：只剩标题栏高度
         self._expanded_height = None   # 收起前的高度（展开时还原）
         self.scale = 1.0               # 图标/列宽缩放比（1.0 = 基准 38px 图标）
+        self._icon_px = ICON_SIZE      # 当前图标边长（_apply_scale 会覆盖）
+        self._cell_w, self._cell_h = GRID_CELL_W, scale_geometry(1.0)["cell_h"]
         if metrics_scale is not None:
             try:
                 self.scale = max(SCALE_MIN, min(SCALE_MAX,
@@ -901,7 +1038,7 @@ class FileWidget(QWidget):
         self.open_btn.setStyleSheet(
             f"QLabel{{color:{COLOR_ACCENT};background:transparent;"
             "padding:3px 8px;border-radius:8px;}"
-            "QLabel:hover{background:rgba(47,111,98,18);}")
+            "QLabel:hover{background:rgba(127,179,164,26);}")
         self.open_btn.setCursor(Qt.PointingHandCursor)
         self.open_btn.mousePressEvent = self._open_folder  # 点击打开收纳文件夹
         title_row.addWidget(self.accent_bar)
@@ -925,6 +1062,10 @@ class FileWidget(QWidget):
         self.list_widget.customContextMenuRequested.connect(self._show_menu)
         self.list_widget.itemDoubleClicked.connect(self._open_item)
         layout.addWidget(self.list_widget)
+
+        # 图标视图专用委托：固定 3 行文件名 + 省略号（避免 Qt 默认委托裁字）
+        self._icon_delegate = IconGridDelegate(self._icon_px)
+        self._list_delegate = QStyledItemDelegate(self.list_widget)
 
         # 缩略图后台解码完成：回填对应条目的图标（信号在 GUI 线程触发）
         # 用 weakref 转发：避免"全局服务 → 绑定方法 → 格子"的强引用把窗口钉住不释放
@@ -981,19 +1122,37 @@ class FileWidget(QWidget):
 
         if not self._bar_mode and not self._collapsed:
             separator = QLinearGradient(14, 0, width - 14, 0)
-            separator.setColorAt(0.0, QColor(31, 35, 39, 0))
+            separator.setColorAt(0.0, QColor(255, 255, 255, 0))
             separator.setColorAt(0.5, COLOR_SEPARATOR)
-            separator.setColorAt(1.0, QColor(31, 35, 39, 0))
+            separator.setColorAt(1.0, QColor(255, 255, 255, 0))
             painter.setPen(QPen(QBrush(separator), 1))
             painter.drawLine(14, TITLE_BAR_HEIGHT,
                              width - 14, TITLE_BAR_HEIGHT)
+
+        # 极淡的顶部斜向高光 + 四角短线：营造"石墨玻璃"的科技感，
+        # 不使用发光/霓虹，也不会盖住图标和文字。
+        sheen = QLinearGradient(0, 0, width, height * 0.55)
+        sheen.setColorAt(0.0, QColor(255, 255, 255, 16))
+        sheen.setColorAt(0.45, QColor(255, 255, 255, 4))
+        sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
+        painter.fillPath(path, QBrush(sheen))
+
+        painter.setPen(QPen(QColor(127, 179, 164, 72), 1))
+        inset, tick = 9, 8
+        for x, y, dx, dy in (
+                (inset, inset, 1, 1),
+                (width - inset, inset, -1, 1),
+                (inset, height - inset, 1, -1),
+                (width - inset, height - inset, -1, -1)):
+            painter.drawLine(x, y, x + tick * dx, y)
+            painter.drawLine(x, y, x, y + tick * dy)
 
         if self._drag_active:
             highlight = QPainterPath()
             highlight.addRoundedRect(
                 QRectF(1, 1, width - 2, height - 2),
                 CORNER_RADIUS - 1, CORNER_RADIUS - 1)
-            painter.fillPath(highlight, QColor(47, 111, 98, 16))
+            painter.fillPath(highlight, QColor(127, 179, 164, 26))
             painter.setPen(QPen(theme.GRID_ACCENT, 1.5))
             painter.drawPath(highlight)
 
@@ -1332,6 +1491,8 @@ class FileWidget(QWidget):
         if self.preview_icons:
             self.list_widget.setStyleSheet(LIST_QSS)
             self.list_widget.setViewMode(QListView.IconMode)
+            self._icon_delegate.set_metrics(self._icon_px)
+            self.list_widget.setItemDelegate(self._icon_delegate)
             self.list_widget.setIconSize(QSize(self._icon_px, self._icon_px))
             self.list_widget.setGridSize(QSize(self._cell_w, self._cell_h))
             self.list_widget.setWordWrap(True)
@@ -1342,6 +1503,7 @@ class FileWidget(QWidget):
         else:
             self.list_widget.setStyleSheet(COMPACT_LIST_QSS)   # 行距更松弛
             self.list_widget.setViewMode(QListView.ListMode)
+            self.list_widget.setItemDelegate(self._list_delegate)
             self.list_widget.setGridSize(QSize())              # 恢复默认行高
             self.list_widget.setWordWrap(False)
             self.list_widget.setUniformItemSizes(False)
@@ -1361,6 +1523,7 @@ class FileWidget(QWidget):
             return
         self._guide_active = True
         self.list_widget.setViewMode(QListView.ListMode)
+        self.list_widget.setItemDelegate(self._list_delegate)  # 引导文字走单列默认委托
         self.list_widget.setWordWrap(True)               # 单列宽行：长提示可正常换行
         self.list_widget.setUniformItemSizes(False)      # 引导条目高度按内容自适应
 
@@ -1426,28 +1589,38 @@ class FileWidget(QWidget):
     # ---------- 文件列表 ----------
 
     def refresh(self):
-        """重新读取收纳文件夹内容并刷新列表（文件夹在前、文件在后）。"""
+        """重新读取收纳文件夹内容并刷新列表（最新放入的条目排在最前）。
+
+        排序规则：按"新近程度"（mtime / 创建时间的较大值）倒序；时间相同的
+        文件夹优先、再按名称不区分大小写。这样拖入/整理进来的新文件直接出现在
+        第一行，而不是被文件名排到列表末尾、需要往下翻才能看到。
+        """
         # 构建期间暂停重绘：200 个条目逐个 addItem 时避免整列表反复刷新。
         self.list_widget.setUpdatesEnabled(False)
         try:
             self.list_widget.clear()
             self._thumb_items.clear()      # 列表已重建：旧的待回填条目全部作废
-            dirs, files = [], []
+            entries = []
             try:
-                # 单次目录遍历同时拿到名称/类型/完整路径，避免每项再 os.path.isdir。
-                with os.scandir(self.folder) as entries:
-                    for entry in entries:
+                # 单次目录遍历同时拿到名称/类型/时间/完整路径，避免逐项再 stat。
+                with os.scandir(self.folder) as scan:
+                    for entry in scan:
                         try:
-                            is_dir = entry.is_dir()
+                            info = entry.stat()
+                            is_dir = stat.S_ISDIR(info.st_mode)
                         except OSError:
+                            info = None
                             is_dir = False
-                        (dirs if is_dir else files).append(
-                            (entry.name, entry.path))
+                        entries.append((
+                            entry_recency_ns(info),      # 新近程度（越大越靠前）
+                            0 if is_dir else 1,          # 同一时间：文件夹在前
+                            entry.name,
+                            entry.path,
+                        ))
             except OSError:
                 pass
-            dirs.sort(key=lambda item: item[0].casefold())
-            files.sort(key=lambda item: item[0].casefold())
-            total = len(dirs) + len(files)
+            entries.sort(key=lambda item: (-item[0], item[1], item[2].casefold()))
+            total = len(entries)
             self._update_count_label(total)
             was_empty = self._is_empty        # 记录刷新前状态：由空转非空需恢复布局
             self._is_empty = (total == 0)
@@ -1468,9 +1641,8 @@ class FileWidget(QWidget):
 
             if was_empty:                     # 由空转非空：撤销引导布局，回到预览方式
                 self._apply_view_mode()
-            entries = dirs + files
             shown = entries[:MAX_LIST_ITEMS]
-            for name, full in shown:
+            for _stamp, _is_file, name, full in shown:
                 item = QListWidgetItem(name)
                 item.setData(Qt.UserRole, full)   # 完整路径存 UserRole
                 item.setToolTip(full)
@@ -1533,13 +1705,16 @@ class FileWidget(QWidget):
     def _open_item(self, item):
         """双击列表项：用系统默认程序打开文件或文件夹。"""
         path = item.data(Qt.UserRole)
-        if path:
-            open_in_shell(path)
+        if path and not open_in_shell(path):
+            self.refresh()          # 文件已被外部删除/占用：立即刷新掉失效条目
 
     def _open_folder(self, _event):
         """点击"打开"：在资源管理器中打开本格子的收纳文件夹。"""
-        os.makedirs(self.folder, exist_ok=True)
-        open_in_shell(self.folder)
+        try:
+            os.makedirs(self.folder, exist_ok=True)
+            open_in_shell(self.folder)
+        except OSError as exc:
+            QMessageBox.warning(self, "无法打开文件夹", str(exc))
 
     def _show_menu(self, pos):
         """右键菜单：条目操作 / 粘贴 / 外观 / 格子管理 / 刷新 五个分区。

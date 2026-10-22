@@ -7,7 +7,7 @@
 
 Windows 桌面文件整理工具（Python + PySide6，独立自研）：
 当前版本 v2.12.0，版本历史见仓库根的 CHANGELOG.md。
-- 桌面右侧悬浮一排**分类格子窗口**（无边框、半透明、置底、不抢任务栏）
+- 桌面右侧悬浮一排**分类格子窗口**（无边框、半透明石墨玻璃、置底、不抢任务栏）
 - 一键整理：把桌面顶层文件/文件夹按扩展名分类移入收纳库
 - 拖拽：把任意文件/文件夹拖进格子即移入对应分类文件夹
 - 撤销：所有移动记录批次化，可"撤销上次"或"恢复全部"
@@ -167,24 +167,20 @@ FileWidget(title, folder, on_drop,
 
 ### 7.3 关键行为
 
-- **图标**：全局单例 `get_icon_provider()`（QFileIconProvider）；紧凑模式不取系统图标。**图片条目优先显示内容缩略图**：`ThumbnailService` 单例把解码放到后台线程池，按 `(路径, mtime, 边长)` 缓存，完成后经 `ready` 信号回填条目；非图片/超 40MB 的图走系统图标兜底。列表按"文件夹在前、文件在后"排序（均 `key=str.lower`）。
+- **图标**：全局单例 `get_icon_provider()`（QFileIconProvider）；紧凑模式不取系统图标。**图片条目优先显示内容缩略图**：`ThumbnailService` 单例把解码放到后台线程池，按 `(路径, mtime, 边长)` 缓存，完成后经 `ready` 信号回填条目；非图片/超 40MB 的图走系统图标兜底。列表按"新近程度"倒序（`max(mtime, 创建时间)`，最新放入的排最前）；时间相同时文件夹优先、再按名称不区分大小写。
 - **预览切换 `set_preview(icons)`**：
-  - 图标视图：`IconMode` + IconSize 38 + GridSize 76x84 + WordWrap + `Adjust` + `LayoutMode Batched`(batchSize 50)
+  - 图标视图：`IconMode` + IconSize 38 + GridSize 76x97 + `IconGridDelegate`（图标居上、文件名最多 3 行并自动省略）+ `Adjust` + `LayoutMode Batched`(batchSize 50)
   - 紧凑列表：`ListMode` + `setGridSize(QSize())` 复位 + IconSize 24（左侧小缩略图）
 - **位置记忆**：`showEvent` 置 `_position_ready=True`（首次 show 前不保存，避免覆盖记忆值）；`mouseMoveEvent` 拖动时 `_pos_timer.start(600)`；到期 `_emit_position()` 回调；`hideEvent` 若定时器活跃则立即停表并回调一次。
 - **右键菜单**（暗色 QSS 内联）：条目上 → 打开/打开所在位置；任意位置 → 打开文件夹 / "预览方式"子菜单（QActionGroup 互斥：图标视图/紧凑列表）/ 刷新。
 - **拖放**：`dragEnterEvent` 有 urls 即 accept；`dropEvent` 收集 `toLocalFile()` 且 `os.path.exists` 的路径 → `on_drop(paths, self)`。
-- `open_in_shell(path)`：nt 用 `os.startfile`，macOS `open`，其余 `xdg-open`（`sys_darwin()` 拆出便于打桩）。
+- `open_in_shell(path)`：nt 用 `os.startfile`，macOS `open`，其余 `xdg-open`；失败返回 `False`（路径失效/U 盘拔出不再抛异常）。
 
 ## 8. control_panel.py（ControlPanel）
 
-- 尺寸 480x660，`PANEL_QSS` 暗色（#1e2025 底、#4cc2ff 强调、圆角 8、一键整理按钮 objectName=`accentBtn`）。
-- 自上而下：
-  1. 按钮行：一键整理桌面(accent) / 撤销上次整理 / 恢复全部
-  2. 收纳目录：QLineEdit(editingFinished 保存并 `on_widgets_rebuild`) + 浏览…
-  3. 开关区（QGridLayout）：开机自启 / 游戏模式（隐藏格子并暂停监听）/ 整理时收走快捷方式 / 整理时收走文件夹 / 预览方式 QComboBox（图标视图/紧凑列表）
-  4. 分类格子勾选区：`[n for n in CATEGORY_RULES if n!="其他"] + [FOLDER_CATEGORY, "其他"]`，勾选即保存并重建
-  5. 搜索区：QLineEdit(placeholder"输入文件名关键词") + 结果 QListWidget + "打开所在位置"按钮
+- 1080x720 深色不透明面板（保留原生边框，可缩放/最小化）；左侧深色导航
+  （整理/格子/设置/关于）+ 右侧分页内容；标题区右上角显示 F8 提示。
+- 主要分区（按页面）：整理概览、格子管理、设置（启动/整理规则/快捷方式/版本更新）、关于。
   6. 状态栏 status_label（ctx.refresh_status 更新）
 - **搜索**：textChanged → 300ms 单发 QTimer 防抖 → `org.search_storage(root, kw, 100)` → 结果项文字=文件名、UserRole=完整路径、tooltip=`[分类] 路径`；双击打开；状态栏"搜索到 N 个结果（已达上限…）"。
 - 自启勾选初始值读 `autostart.get_autostart_enabled()`（注册表为真源）；切换调 `ctx.set_autostart`，OSError 时回滚勾选 + QMessageBox。
@@ -1068,3 +1064,38 @@ python -m pytest tests/ -q    # 期望 143 passed
 
 - 全量 **236 passed**；新增 `test_layout_store.py`、`test_instance_guard.py`
   及布局迁移/副屏缺失/重叠消解/自启参数回归用例。
+
+## 31. 未发布：稳定性加固与石墨玻璃（2026-10-22）
+
+### 崩溃可观测性（`crash_guard.py`）
+
+- `install()` 在 `QApplication` 之前调用：`sys.excepthook`（含 Qt 槽函数异常）、
+  `threading.excepthook`、`faulthandler`（原生崩溃线程栈）统一写入
+  `%APPDATA%\MyDeskOrganizer\logs\app.log`，超过 2 MB 轮转为 `.1`。
+- 日志写入失败只静默返回，任何情况下不阻塞启动；面板底栏「日志」可直接打开目录。
+- 启动失败（`AppContext` 初始化、构建格子）写完整 traceback 并弹一次提示，不静默消失。
+
+### 配置与历史可靠性（`config.py`）
+
+- `_atomic_write`：新内容先落 `.tmp` + `fsync`，旧文件轮换为 `.bak`，最后原子替换；
+  替换失败自动把 `.bak` 放回，正式文件永远不是半截 JSON。
+- `load_config` / `load_history`：主文件损坏时自动读 `.bak`；`_sanitize_config`
+  对 bool/int/str/dict/categories 做类型白名单，坏字段只回退该字段默认值。
+
+### 自启 / 单实例 / 系统兼容
+
+- 自启写入后回读校验，失败抛 `OSError` 让 UI 回滚；启动时 `sync_autostart` 修正
+  换目录/源码转 exe 后的旧命令；`--autostart` 延迟 2 秒等 Explorer 就绪。
+- `instance_guard.tryLock(1000)` 等待陈旧锁释放；唤醒旧实例最多重试 5 次。
+- `win_compat`：AppUserModelID、Win 版本判断；所有系统调用 try/except。
+  曾用于系统对话框深色标题栏的 DWM 事件注入已移除（个别 Win11+Qt 组合会触发
+  原生访问违例，稳定性优先）。
+- `open_in_shell` 返回 bool；打开文件/文件夹、创建收纳目录失败只提示/刷新。
+
+### 视觉
+
+- `theme.py` 切换为「石墨玻璃」：桌面格子深色半透明（壁纸透出约 15%~20%）、
+  1px 冷灰边、四角短线、顶部微光；低饱和冷灰青 `#7FB3A4`，无发光/霓虹。
+- 控制面板保持**不透明深色**原生窗口（用户明确不需要面板透明），避免透明/
+  无边框窗口在部分 DPI 与多屏环境下的显示问题；菜单/输入框/复选框/搜索列表/
+  关于页统一深色玻璃配色。

@@ -2,18 +2,20 @@
 """GUI 冒烟测试：offscreen 平台下构造格子窗口，验证刷新、空状态、拖出数据与预览切换。"""
 import os
 import sys
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
 from PySide6.QtCore import QSize, Qt  # noqa: E402
+from PySide6.QtGui import QFont, QFontMetrics  # noqa: E402
 from PySide6.QtWidgets import QApplication, QListView  # noqa: E402
 
 from widgets import (COLLAPSED_HEIGHT, COMPACT_ICON_PX, FileWidget,  # noqa: E402
                      MIN_WIDGET_H, MIN_WIDGET_W, SCALE_MAX, SCALE_MIN,
                      SearchWidget, _icon_stats, _url_icon_file,
                      decode_thumbnail, get_file_icon, get_thumbnail_service,
-                     is_thumbnailable, scale_geometry)
+                     is_thumbnailable, scale_geometry, wrap_icon_label)
 
 _APP = QApplication.instance() or QApplication(sys.argv)
 
@@ -50,6 +52,20 @@ def test_refresh_lists_files_with_paths(tmp_path):
     item = widget.list_widget.item(0)
     assert item.text() == "笔记.txt"
     assert item.data(Qt.UserRole) == str(tmp_path / "文档" / "笔记.txt")
+    widget.close()
+
+
+def test_refresh_puts_newest_entry_first(tmp_path):
+    """新放入的文件排在最前（而不是按文件名沉到列表末尾）。"""
+    widget = _make_widget(tmp_path)
+    folder = tmp_path / "文档"
+    (folder / "a_旧文件.txt").write_text("old", encoding="utf-8")
+    time.sleep(0.02)                       # 保证创建时间可区分
+    (folder / "z_新文件.txt").write_text("new", encoding="utf-8")
+    widget.refresh()
+
+    assert widget.list_widget.item(0).text() == "z_新文件.txt"
+    assert widget.list_widget.item(1).text() == "a_旧文件.txt"
     widget.close()
 
 
@@ -91,9 +107,32 @@ def test_scale_geometry_base_and_clamp():
     """缩放几何：基准值正确，超范围输入钳制到档位边界。"""
     base = scale_geometry(1.0)
     assert base["width"] == 270 and base["height"] == 360
-    assert base["icon"] == 38 and base["cell_w"] == 76 and base["cell_h"] == 84
+    assert base["icon"] == 38 and base["cell_w"] == 76 and base["cell_h"] == 97
     assert scale_geometry(10.0) == scale_geometry(SCALE_MAX)
     assert scale_geometry(0.1) == scale_geometry(SCALE_MIN)
+
+
+def test_icon_cell_height_fits_three_name_lines():
+    """图标单元格必须容纳图标 + 三行完整文件名，否则文字会被裁切。"""
+    for scale in SCALE_MIN, 1.0, SCALE_MAX:
+        geo = scale_geometry(scale)
+        metrics = QFontMetrics(QFont("Microsoft YaHei UI", geo["item_pt"]))
+        assert geo["cell_h"] >= geo["icon"] + 3 * metrics.lineSpacing()
+
+
+def test_wrap_icon_label_caps_lines_and_elides():
+    """超长文件名最多三行，最后一行带省略号，且每行都不超过单元格宽度。"""
+    metrics = QFontMetrics(QFont("Microsoft YaHei UI", 9))
+    width = 70
+    text = "初一数学专题复习资料合集（含答案与解析）2026秋季版.xlsx"
+    lines = wrap_icon_label(text, metrics, width, 3)
+
+    assert len(lines) == 3
+    assert lines[-1].endswith("…")
+    assert all(metrics.horizontalAdvance(line) <= width for line in lines)
+
+    short_width = metrics.horizontalAdvance("笔记.txt") + 4
+    assert wrap_icon_label("笔记.txt", metrics, short_width, 3) == ["笔记.txt"]
 
 
 def test_widget_metrics_zoom_steps(tmp_path):
@@ -462,7 +501,9 @@ def test_delete_key_sends_selected_paths(tmp_path):
 
     received = []
     widget.list_widget.delete_cb = received.append
-    widget.list_widget.setCurrentItem(widget.list_widget.item(0))
+    target = next(widget.list_widget.item(i) for i in range(widget.list_widget.count())
+                  if widget.list_widget.item(i).text() == "a.txt")
+    widget.list_widget.setCurrentItem(target)
     QApplication.sendEvent(
         widget.list_widget,
         QKeyEvent(QEvent.KeyPress, Qt.Key_Delete, Qt.NoModifier))

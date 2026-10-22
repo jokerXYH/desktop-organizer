@@ -11,8 +11,13 @@ from PySide6.QtCore import QLockFile
 
 
 def acquire(lock_path: str):
-    """尝试获取锁；成功返回 QLockFile（调用方需持有到进程退出），失败返回 None。"""
+    """尝试获取锁；成功返回 QLockFile（调用方需持有到进程退出），失败返回 None。
+
+    tryLock 等待 1 秒而不是立即失败：进程崩溃后 QLockFile 需要一点时间判定
+    陈旧锁；登录时两个启动项同时到达也在这里串行化，后到者能稳定地走
+    "唤醒已有实例"分支。
+    """
     os.makedirs(os.path.dirname(os.path.abspath(lock_path)), exist_ok=True)
     lock = QLockFile(str(lock_path))
     lock.setStaleLockTime(10000)   # 崩溃残留锁最多阻塞 10 秒
-    return lock if lock.tryLock(0) else None
+    return lock if lock.tryLock(1000) else None
