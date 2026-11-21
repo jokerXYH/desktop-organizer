@@ -11,6 +11,7 @@ import stat
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from functools import lru_cache
 from typing import Dict, List, Tuple
 
 # 文件夹专用分类名：目录不按扩展名分类，统一归入此类
@@ -540,17 +541,30 @@ def search_storage(root: str, keyword: str,
     return results
 
 
-def _pinyin_matches(name: str, keyword: str) -> bool:
-    """拼音匹配：文件名全拼或首字母包含关键词时命中（pypinyin 缺失时返回 False）。"""
+@lru_cache(maxsize=8192)
+def _pinyin_keys(name: str):
+    """计算文件名的拼音检索键：返回 (全拼, 首字母)，均为小写。
+
+    结果按文件名缓存：搜索每次按键都会全库扫描，同一文件名的 lazy_pinyin
+    转换（纯 Python 实现，且原实现每次调用都重复 import）只需做一次，
+    后续按键与重复扫描直接复用，只做子串比较。pypinyin 缺失时返回 None。
+    """
     try:
         from pypinyin import lazy_pinyin
     except ImportError:
-        return False
+        return None
     parts = lazy_pinyin(name)
-    if keyword in "".join(parts).lower():
-        return True
+    full = "".join(parts).lower()
     initials = "".join(part[0] for part in parts if part).lower()
-    return keyword in initials
+    return full, initials
+
+
+def _pinyin_matches(name: str, keyword: str) -> bool:
+    """拼音匹配：文件名全拼或首字母包含关键词时命中（pypinyin 缺失时返回 False）。"""
+    keys = _pinyin_keys(name)
+    if keys is None:
+        return False
+    return keyword in keys[0] or keyword in keys[1]
 
 
 def move_to_recycle_bin(path: str) -> bool:

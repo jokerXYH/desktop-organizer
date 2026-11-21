@@ -6,7 +6,7 @@
 ## 1. 项目是什么
 
 Windows 桌面文件整理工具（Python + PySide6，独立自研）：
-当前版本 v2.12.0，版本历史见仓库根的 CHANGELOG.md。
+当前版本 v2.13.0，版本历史见仓库根的 CHANGELOG.md。
 - 桌面右侧悬浮一排**分类格子窗口**（无边框、半透明石墨玻璃、置底、不抢任务栏）
 - 一键整理：把桌面顶层文件/文件夹按扩展名分类移入收纳库
 - 拖拽：把任意文件/文件夹拖进格子即移入对应分类文件夹
@@ -45,7 +45,7 @@ Windows 桌面文件整理工具（Python + PySide6，独立自研）：
 ├── assets\            app_icon.ico（快捷方式与打包 exe 共用）
 ├── tools\             make_readme_screenshots.py / make_app_icon.py / build_exe.py
 ├── requirements.txt   PySide6 + pytest
-└── tests\             conftest.py + 8 个测试文件，共 139 用例（含 GUI/集成冒烟）
+└── tests\             conftest.py + 多个测试文件，共 250 用例（含 GUI/集成冒烟）
 ```
 
 ## 4. organizer.py（核心逻辑层）
@@ -1099,3 +1099,40 @@ python -m pytest tests/ -q    # 期望 143 passed
 - 控制面板保持**不透明深色**原生窗口（用户明确不需要面板透明），避免透明/
   无边框窗口在部分 DPI 与多屏环境下的显示问题；菜单/输入框/复选框/搜索列表/
   关于页统一深色玻璃配色。
+
+## 32. v2.13.0 实测崩溃修复 / 对齐修复 / 性能与界面（2026-11-21）
+
+### 崩溃（app.log 取证，非猜测）
+
+- **0x8001010D 原生崩溃**：实机日志 2026-11 多次记录 `Windows fatal exception:
+  0x8001010d`，其中一次栈顶明确在 `open_in_shell` 的 `os.startfile`。根因：
+  Qt 事件回调（双击打开/菜单动作）运行在输入同步调用派发层级里，
+  ShellExecute 的 COM 外呼被拒并以 SEH 异常击穿进程。
+  修复：`widgets.open_in_shell` 在 Windows 上经 `_startfile_via_thread`
+  分发——独立短命线程拥有干净 COM 上下文，毫秒级返回、join 2s 兜底；
+  成功/失败语义不变（真机 100 次失败路径 + 真实打开验证零崩溃）。
+- 撤销一项误报：打包 exe 出现两个同名进程是 PyInstaller onefile 的
+  引导进程 + 子进程正常结构（父子关系已核实），不是"僵尸实例"。
+
+### 对齐（几何取证：标题行实测 y 6..24、列表顶 28、旧常量 42）
+
+- 分隔线改画在 `list_widget.y() - spacing/2`（标题与列表的空隙），
+  不再用固定常量——v2.12 调字号后旧值已深入列表 14px 横穿首行。
+- 收起高度改 `title_bar_height()`（布局 sizeHint 计算，实测 34px，
+  旧固定值 50 底部多 16px 死空间）；双击/右键标题区判定改 `_in_title_area`
+  跟随布局，`TITLE_BAR_HEIGHT/COLLAPSED_HEIGHT` 常量已删除，
+  测试断言改为对 `title_bar_height()` 断言。
+- 核对通过项：图标网格右侧留白为流式布局固有行为（资源管理器同款），
+  非缺陷；标题行内各控件垂直居中一致（accent bar 与标题光学中心对齐）。
+
+### 性能与界面
+
+- `organizer._pinyin_keys` lru_cache（搜索每键全库拼音转换 → 一次转换跨键复用），
+  2000 文件库逐键 8.2ms→3.4ms；`_icon_stats` 字节级采样；`refresh` 复用
+  scandir stat（每条目省最多 3 次 stat）；菜单禁用项置灰、搜索框清空按钮、
+  委托颜色统一走 theme token；搜索条隐藏标签死写入清除。
+
+### 测试
+
+- 全量 **250 passed**（249 基线 + 1 个 open_in_shell 线程分发回归）；
+  收起高度相关断言改为动态值，随字体/DPI 不再脆断。

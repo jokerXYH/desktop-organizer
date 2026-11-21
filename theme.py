@@ -69,6 +69,7 @@ MENU_QSS = """
 QMenu{background:rgba(14,20,26,242);color:#E6EDF1;
       border:1px solid rgba(255,255,255,34);border-radius:12px;padding:6px;}
 QMenu::item{padding:7px 22px;border-radius:8px;}
+QMenu::item:disabled{color:#6E7B84;}
 QMenu::item:selected{background:rgba(127,179,164,34);color:#F2F8F5;}
 QMenu::separator{height:1px;background:rgba(255,255,255,24);margin:5px 8px;}
 """
@@ -154,6 +155,7 @@ DIALOG_QSS = """
 QMenu{background:rgba(14,20,26,242);color:#E6EDF1;
       border:1px solid rgba(255,255,255,34);border-radius:12px;padding:6px;}
 QMenu::item{padding:7px 22px;border-radius:8px;}
+QMenu::item:disabled{color:#6E7B84;}
 QMenu::item:selected{background:rgba(127,179,164,34);color:#F2F8F5;}
 QMenu::separator{height:1px;background:rgba(255,255,255,24);margin:5px 8px;}
 QToolTip{background:rgba(14,20,26,245);color:#E6EDF1;

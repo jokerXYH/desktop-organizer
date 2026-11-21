@@ -37,8 +37,6 @@ import theme
 WIDGET_WIDTH = 270        # 格子宽度（像素）
 WIDGET_HEIGHT = 360       # 格子高度（像素）
 CORNER_RADIUS = 16        # 圆角半径
-TITLE_BAR_HEIGHT = 42     # 标题栏高度
-COLLAPSED_HEIGHT = TITLE_BAR_HEIGHT + 8   # 收起形态总高度：只剩标题行 + 上下边距
 ICON_SIZE = 38            # 图标模式下文件图标的边长（像素）
 GRID_CELL_W = 76          # 图标模式网格单元宽（保证每行 3 列排满）
 GRID_TEXT_LINES = 3       # 图标模式下文件名最多显示几行（超出才用省略号）
@@ -98,6 +96,16 @@ COLOR_TEXT = theme.COLOR_TEXT
 COLOR_TEXT_DIM = theme.COLOR_TEXT_DIM
 COLOR_TEXT_FAINT = theme.COLOR_TEXT_FAINT
 COLOR_ACCENT = theme.COLOR_ACCENT
+
+# 图标视图委托的选中/悬停绘制色：从 theme 强调色派生的模块常量。
+# 逐条目 paint 不再重复构造 QColor（微开销），且颜色统一由 theme.py 供给。
+DELEGATE_SELECT_BG = QColor(theme.GRID_ACCENT)
+DELEGATE_SELECT_BG.setAlpha(38)
+DELEGATE_SELECT_PEN = QColor(theme.GRID_ACCENT)
+DELEGATE_SELECT_PEN.setAlpha(96)
+DELEGATE_HOVER_BG = QColor(255, 255, 255, 14)
+DELEGATE_TEXT_SELECTED = QColor("#F2F8F5")
+DELEGATE_TEXT = QColor(theme.COLOR_TEXT)
 
 LIST_QSS = theme.GRID_QSS
 COMPACT_LIST_QSS = theme.COMPACT_LIST_QSS
@@ -247,15 +255,43 @@ def shell_fallback_icon(path: str):
         user32.DestroyIcon(hicon)
 
 
+def _startfile_via_thread(path: str) -> bool:
+    """在独立短命线程中执行 os.startfile，成功返回 True。
+
+    实机日志取证（%APPDATA%\\MyDeskOrganizer\\logs\\app.log，2026-11 多次）：
+    在 Qt 事件回调（双击条目、右键/面板的"打开"动作）里直接调用 os.startfile
+    偶发 Windows 致命异常 0x8001010D（RPC_E_CANTCALLOUT_INSYNCCALLLEVEL）——
+    主线程正处于输入同步调用的派发中，ShellExecute 发起的 COM 外呼被拒，
+    并以 SEH 异常直接击穿进程（faulthandler 只能留栈，无法恢复）。
+    专用线程拥有干净的 COM 上下文、不在任何输入同步派发层级里，从根上
+    避开该状态；startfile 本身毫秒级返回，短暂 join 不影响界面响应。
+    """
+    outcome = {}
+
+    def _open():
+        try:
+            os.startfile(path)
+            outcome["ok"] = True
+        except OSError:
+            outcome["ok"] = False
+
+    worker = threading.Thread(target=_open, daemon=True)
+    worker.start()
+    worker.join(timeout=2.0)
+    return bool(outcome.get("ok"))
+
+
 def open_in_shell(path: str) -> bool:
     """用系统默认方式打开文件或文件夹；失败返回 False（不向上抛异常）。
 
     路径可能刚被外部程序删除、U 盘被拔出、或没有关联程序；这些都属于
     "用户操作落空"，不应该变成未捕获异常把托盘程序带崩。
+    Windows 上经 _startfile_via_thread 分发（防输入同步派发态下的
+    COM 原生崩溃，机制见其注释）。
     """
     try:
         if os.name == "nt":
-            os.startfile(path)
+            return _startfile_via_thread(path)
         elif sys_darwin():
             subprocess.call(["open", path])
         else:
@@ -266,7 +302,13 @@ def open_in_shell(path: str) -> bool:
 
 
 def _icon_stats(icon, size: int = 38):
-    """采样统计图标：返回 (白色占比, 彩色占比)，用于识别"白页"坏图标。"""
+    """采样统计图标：返回 (白色占比, 彩色占比)，用于识别"白页"坏图标。
+
+    采样改为字节级读取：pixelColor 每次调用都要构造 QColor 并做格式换算，
+    冷启动时成百上千个图标的逐像素采样是 GUI 线程上可感知的开销；转成
+    RGBA8888（字节序固定为 R,G,B,A，且为非预乘格式，分量与 pixelColor
+    一致）后按同一 8×8 网格取字节，判定阈值完全不变。
+    """
     pixmap = icon.pixmap(size, size)
     if pixmap.isNull():
         return 1.0, 0.0
@@ -274,14 +316,18 @@ def _icon_stats(icon, size: int = 38):
     width, height = image.width(), image.height()
     if width <= 0 or height <= 0:
         return 1.0, 0.0
+    image = image.convertToFormat(QImage.Format_RGBA8888)
+    data = bytes(image.constBits())
+    stride = image.bytesPerLine()
     whites = colors = samples = 0
     for y in range(0, height, max(1, height // 8)):
+        row = y * stride
         for x in range(0, width, max(1, width // 8)):
-            color = image.pixelColor(x, y)
+            base = row + x * 4
+            alpha, r, g, b = data[base + 3], data[base], data[base + 1], data[base + 2]
             samples += 1
-            if color.alpha() <= 40:
+            if alpha <= 40:
                 continue
-            r, g, b = color.red(), color.green(), color.blue()
             if r > 225 and g > 225 and b > 225:
                 whites += 1
             if max(r, g, b) - min(r, g, b) > 40:
@@ -304,17 +350,19 @@ def _url_icon_file(path: str):
     return None
 
 
-def get_file_icon(path: str):
+def get_file_icon(path: str, mtime: float = None):
     """获取文件图标（带缓存）。
 
     修复个别环境下 QFileIconProvider 对 .lnk/.url 返回"白页"坏图标的问题：
     采样检测到坏图标时——.url 优先直读 IconFile（Steam 游戏图标），
     否则改走 Shell 兜底（SHGetFileInfoW），取到更"彩色"的图标才替换。
+    :param mtime: 已知的文件修改时间（缓存键的一部分）；None 时现取。
     """
-    try:
-        mtime = os.path.getmtime(path)
-    except OSError:
-        mtime = 0
+    if mtime is None:
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = 0
     key = (path, mtime)
     cached = _FILE_ICON_CACHE.get(key)
     if cached is not None:
@@ -358,14 +406,20 @@ def sys_darwin() -> bool:
 
 # ---------- 图片缩略图（后台解码 + 全局缓存） ----------
 
-def is_thumbnailable(path: str) -> bool:
-    """是否值得生成缩略图：扩展名支持像素解码，且源文件体积在阈值内。"""
+def is_thumbnailable(path: str, size: int = None) -> bool:
+    """是否值得生成缩略图：扩展名支持像素解码，且源文件体积在阈值内。
+
+    :param size: 已知的文件体积（字节）；None 时现取。FileWidget.refresh 的
+        scandir 已经 stat 过每个条目，把结果传进来可省一次磁盘访问。
+    """
     if os.path.splitext(path)[1].lower() not in THUMB_EXTS:
         return False
-    try:
-        return os.path.getsize(path) <= THUMB_MAX_SRC_BYTES
-    except OSError:
-        return False
+    if size is None:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return False
+    return size <= THUMB_MAX_SRC_BYTES
 
 
 def decode_thumbnail(path: str, size: int) -> QImage:
@@ -411,15 +465,18 @@ class ThumbnailService(QObject):
         self._cache = {}                       # {(路径, mtime, 边长): QImage}
         self._pending = set()                  # 正在解码的键
 
-    def get(self, path: str, size: int):
+    def get(self, path: str, size: int, mtime: float = None):
         """取缩略图：命中缓存返回 QImage；未命中则提交后台任务并返回 None。
 
         调用方（GUI 线程）拿到 None 时先显示系统图标占位，等 ready 信号回填。
+        :param mtime: 已知的文件修改时间；None 时现取（同 is_thumbnailable，
+            供调用方复用 scandir 已拿到的 stat 信息）。
         """
-        try:
-            mtime = os.path.getmtime(path)
-        except OSError:
-            return None
+        if mtime is None:
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                return None
         key = (path, mtime, int(size))
         with self._lock:
             cached = self._cache.get(key)
@@ -753,12 +810,12 @@ class IconGridDelegate(QStyledItemDelegate):
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing)
         if selected:
-            painter.setPen(QPen(QColor(127, 179, 164, 96), 1))
-            painter.setBrush(QColor(127, 179, 164, 38))
+            painter.setPen(QPen(DELEGATE_SELECT_PEN, 1))
+            painter.setBrush(DELEGATE_SELECT_BG)
             painter.drawRoundedRect(option.rect.adjusted(1, 1, -1, -1), 10, 10)
         elif hovered:
             painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(255, 255, 255, 14))
+            painter.setBrush(DELEGATE_HOVER_BG)
             painter.drawRoundedRect(option.rect.adjusted(1, 1, -1, -1), 10, 10)
 
         metrics = QFontMetrics(option.font)
@@ -770,7 +827,7 @@ class IconGridDelegate(QStyledItemDelegate):
             icon.paint(painter, icon_rect, Qt.AlignHCenter | Qt.AlignTop)
 
         painter.setFont(option.font)
-        painter.setPen(QColor("#F2F8F5") if selected else QColor(COLOR_TEXT))
+        painter.setPen(DELEGATE_TEXT_SELECTED if selected else DELEGATE_TEXT)
         line_h = metrics.lineSpacing()
         y = icon_rect.bottom() + 5
         lines = wrap_icon_label(str(index.data(Qt.DisplayRole) or ""),
@@ -1121,13 +1178,16 @@ class FileWidget(QWidget):
         painter.drawPath(path)
 
         if not self._bar_mode and not self._collapsed:
+            # 分隔线跟随实际布局几何（标题行与列表之间的空隙），不用固定
+            # 常量：v2.12 改了字号与边距后旧常量 42 已深入列表区 14px，
+            # 会横穿第一行条目；按布局取值在任何字号/DPI 下都落在空隙里。
+            sep_y = self.list_widget.y() - self.layout().spacing() // 2
             separator = QLinearGradient(14, 0, width - 14, 0)
             separator.setColorAt(0.0, QColor(255, 255, 255, 0))
             separator.setColorAt(0.5, COLOR_SEPARATOR)
             separator.setColorAt(1.0, QColor(255, 255, 255, 0))
             painter.setPen(QPen(QBrush(separator), 1))
-            painter.drawLine(14, TITLE_BAR_HEIGHT,
-                             width - 14, TITLE_BAR_HEIGHT)
+            painter.drawLine(14, sep_y, width - 14, sep_y)
 
         # 极淡的顶部斜向高光 + 四角短线：营造"石墨玻璃"的科技感，
         # 不使用发光/霓虹，也不会盖住图标和文字。
@@ -1239,13 +1299,37 @@ class FileWidget(QWidget):
         self._clamp_into_screens()       # 兜底：鼠标操作结束后保证完全在屏幕内
         super().mouseReleaseEvent(event)
 
+    def title_bar_height(self) -> int:
+        """收起形态的窗口高度：上边距 + 标题行理想高度 + 下边距。
+
+        用标题行布局的 sizeHint（不受布局拉伸/未激活影响），而非任何控件的
+        当前 height()：收起时列表被隐藏，标题行会被 QVBoxLayout 拉伸占满
+        全窗（此前固定 50px 常量在标准字体下底部多出约 16px 死空间）。
+        """
+        layout = self.layout()
+        layout.activate()               # 幂等：确保标题行几何已计算
+        margins = layout.contentsMargins()
+        row = layout.itemAt(0)            # 标题行（QHBoxLayout）
+        row_h = (row.sizeHint().height() if row is not None
+                 else self.title_label.sizeHint().height())
+        return margins.top() + row_h + margins.bottom()
+
+    def _in_title_area(self, y) -> bool:
+        """坐标是否落在标题区：收起形态整个窗口都算，展开态为列表顶以上。"""
+        if self._bar_mode:
+            return False
+        if self._collapsed:
+            return True
+        self.layout().activate()        # 布局未激活时列表 y 还是默认 0
+        return y <= self.list_widget.y()
+
     def mouseDoubleClickEvent(self, event):
         """双击标题栏：收起/展开格子（Fences / 桌面整理类产品的通用交互）。
 
         列表区域的双击属于"打开文件"，不在此处理。
         """
-        if (event.button() == Qt.LeftButton and not self._bar_mode
-                and event.position().y() <= TITLE_BAR_HEIGHT):
+        if (event.button() == Qt.LeftButton
+                and self._in_title_area(event.position().y())):
             self.set_collapsed(not self._collapsed)
             event.accept()
             return
@@ -1253,8 +1337,7 @@ class FileWidget(QWidget):
 
     def contextMenuEvent(self, event):
         """标题区（含收起形态）右键：弹出格子菜单；列表区仍由列表自身处理。"""
-        if not self._bar_mode and (self._collapsed
-                                   or event.pos().y() <= TITLE_BAR_HEIGHT):
+        if self._in_title_area(event.pos().y()):
             self._build_menu(QPoint(-1, -1)).exec(event.globalPos())
             event.accept()
             return
@@ -1278,7 +1361,7 @@ class FileWidget(QWidget):
             self._expanded_height = self.height()
             self.list_widget.hide()
             self.layout().activate()   # 先让布局排除已隐藏的列表，最小高度约束随之收紧
-            self.resize(self.width(), COLLAPSED_HEIGHT)
+            self.resize(self.width(), self.title_bar_height())
         else:
             self.list_widget.show()
             self.layout().activate()
@@ -1616,6 +1699,7 @@ class FileWidget(QWidget):
                             0 if is_dir else 1,          # 同一时间：文件夹在前
                             entry.name,
                             entry.path,
+                            info,                        # stat 快照：图标管线复用，省重复磁盘访问
                         ))
             except OSError:
                 pass
@@ -1642,7 +1726,7 @@ class FileWidget(QWidget):
             if was_empty:                     # 由空转非空：撤销引导布局，回到预览方式
                 self._apply_view_mode()
             shown = entries[:MAX_LIST_ITEMS]
-            for _stamp, _is_file, name, full in shown:
+            for _stamp, _is_file, name, full, info in shown:
                 item = QListWidgetItem(name)
                 item.setData(Qt.UserRole, full)   # 完整路径存 UserRole
                 item.setToolTip(full)
@@ -1650,7 +1734,7 @@ class FileWidget(QWidget):
                     item.setTextAlignment(Qt.AlignHCenter)
                 else:
                     item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-                self._set_item_icon(item, full)   # 图片走缩略图，其余走系统图标
+                self._set_item_icon(item, full, info)   # 图片走缩略图，其余走系统图标
                 self.list_widget.addItem(item)
             if total > MAX_LIST_ITEMS:        # 超出上限时显示提示占位条目
                 tip = QListWidgetItem(
@@ -1661,20 +1745,24 @@ class FileWidget(QWidget):
             self.list_widget.setUpdatesEnabled(True)
             self.list_widget.viewport().update()
 
-    def _set_item_icon(self, item: QListWidgetItem, path: str):
+    def _set_item_icon(self, item: QListWidgetItem, path: str, info=None):
         """给条目设置图标：图片显示内容缩略图，其余显示 Windows 系统图标。
 
         缩略图解码在后台线程：首次遇到某张图时先放系统图标占位，解码完成后
         经 _on_thumb_ready 回填（命中缓存则立即显示）；非图片直接走 get_file_icon。
+        :param info: scandir 的 stat 快照（体积/修改时间）；传进来可让缩略图
+            准入、缓存键与图标缓存键全部复用，省掉每条目最多 3 次重复 stat。
         """
         size = self._icon_px if self.preview_icons else COMPACT_ICON_PX
-        if is_thumbnailable(path):
-            image = get_thumbnail_service().get(path, size)
+        file_size = getattr(info, "st_size", None)
+        mtime = getattr(info, "st_mtime", None)
+        if is_thumbnailable(path, file_size):
+            image = get_thumbnail_service().get(path, size, mtime)
             if image is not None:
                 item.setIcon(QIcon(QPixmap.fromImage(image)))
                 return
             self._thumb_items[(path, size)] = item    # 等待后台解码回填
-        icon = get_file_icon(path)        # 白页修复 + Shell 兜底 + 缓存
+        icon = get_file_icon(path, mtime)        # 白页修复 + Shell 兜底 + 缓存
         if not icon.isNull():
             item.setIcon(icon)
 
@@ -1913,6 +2001,7 @@ class SearchWidget(FileWidget):
         self.setAcceptDrops(False)         # 搜索条不接受拖入
         self.search_edit = QLineEdit(self)
         self.search_edit.setPlaceholderText("搜索收纳库（支持拼音）")
+        self.search_edit.setClearButtonEnabled(True)   # 一键清空关键词，收起结果
         self.search_edit.setStyleSheet(SEARCH_EDIT_QSS)
         self.layout().insertWidget(1, self.search_edit)   # 输入框放在标题栏与列表之间
         self.layout().setStretch(1, 0)     # 输入框只占自身高度，不参与纵向拉伸
@@ -1977,7 +2066,7 @@ class SearchWidget(FileWidget):
         keyword = self.search_edit.text().strip()
         self.list_widget.clear()
         self._thumb_items.clear()
-        self.count_label.setText("")
+        # count_label 在扁平形态下已隐藏，不再写入（结果数以展开行数直接可见）
         if not keyword:                      # 关键词为空：收起结果区（只剩搜索框）
             self._set_result_rows(0)
             return
@@ -1996,7 +2085,7 @@ class SearchWidget(FileWidget):
     def _fill_results(self, results: list):
         """把搜索结果填充到列表：固定单列、一行一条，并按结果条数展开窗口。"""
         results = results or []
-        self.count_label.setText(f"{len(results)} 项")
+        # count_label 在扁平形态下已隐藏：结果数直接体现在展开的行数上
         for category, path in results[:MAX_LIST_ITEMS]:
             # 单列列表行宽裕，行尾带分类标签方便区分同名文件
             item = QListWidgetItem(f"{os.path.basename(path)}（{category}）")

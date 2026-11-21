@@ -14,7 +14,7 @@ import layout_store  # noqa: E402
 import organizer as org  # noqa: E402
 import shell_menu  # noqa: E402
 from main import AppContext  # noqa: E402
-from widgets import COLLAPSED_HEIGHT, WIDGET_GAP  # noqa: E402
+from widgets import WIDGET_GAP  # noqa: E402
 
 _APP = QApplication.instance() or QApplication(sys.argv)
 
@@ -468,7 +468,6 @@ def test_search_grid(ctx):
 
     assert search.list_widget.count() == 1
     assert search.list_widget.item(0).data(Qt.UserRole).endswith("季度报告.docx")
-    assert "1 项" in search.count_label.text()
 
     ctx.set_search_grid(False)
     assert not any(w.title == "搜索" for w in ctx.widgets)
@@ -505,7 +504,7 @@ def test_search_grid_ignores_stale_results(ctx):
         search._search_seq, "完全不同的词",
         ctx.search_service.run_now("完全不同的词", 200))
     assert search.list_widget.count() == 0
-    assert search.count_label.text() == "0 项"
+    assert search.list_widget.isHidden()      # 无结果：重新收起为纯搜索条
 
 
 def test_panel_search_async_and_stale_guard(ctx):
@@ -932,15 +931,15 @@ def test_collapse_state_persists_across_rebuild(ctx):
     """收起状态写入配置并在重建后保留；展开恢复原高度。"""
     doc = next(w for w in ctx.widgets if w.title == "文档")
     doc.set_collapsed(True)
-    assert doc.height() == COLLAPSED_HEIGHT
+    assert doc.height() == doc.title_bar_height()
     assert cfg.load_config()["widgetCollapsed"]["文档"] is True
 
     ctx.rebuild_widgets()
     doc2 = next(w for w in ctx.widgets if w.title == "文档")
-    assert doc2.height() == COLLAPSED_HEIGHT
+    assert doc2.height() == doc2.title_bar_height()
 
     doc2.set_collapsed(False)
-    assert doc2.height() > COLLAPSED_HEIGHT
+    assert doc2.height() > doc2.title_bar_height()
     assert cfg.load_config()["widgetCollapsed"]["文档"] is False
 
 

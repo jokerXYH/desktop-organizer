@@ -1,7 +1,7 @@
 {
-  "version": "2.12.0",
-  "url": "https://github.com/jokerXYH/desktop-organizer/releases/download/v2.12.0/desktop-organizer_v2.12.0.exe",
-  "sha256": "f48811408b7a3112124b714bbbff8b408c3062a27d4619c485d9b9b17a993978",
+  "version": "2.13.0",
+  "url": "https://github.com/jokerXYH/desktop-organizer/releases/download/v2.13.0/desktop-organizer_v2.13.0.exe",
+  "sha256": "2b995c229a44a2f5b89ded2ce90628efc43efdeac38c66bddece57a76583b223",
   "page": "https://github.com/jokerXYH/desktop-organizer/releases/latest",
-  "notes": "瓷白纸感界面重构：格子与控制面板换成更简约的纸感样式，面板改为左侧导航分页；布局记忆升级为显示器感知，副屏延迟出现也会回到原位置，历史重叠自动错开；Win10 开机自启带延迟恢复、路径自检与单实例锁；文件列表与拖动性能优化。"
+  "notes": "修复打开文件/文件夹时偶发的原生崩溃（实机日志多次记录 0x8001010D，改为独立线程分发 ShellExecute）；样式对齐修复：标题分隔线不再穿过首行条目、收起条消除底部 16px 死空间；性能优化：拼音搜索缓存（逐键搜索提速约 2.4 倍）、图标采样与磁盘 stat 复用；界面细节：菜单禁用项可读、搜索框一键清空。"
 }

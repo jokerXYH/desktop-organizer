@@ -11,11 +11,12 @@ from PySide6.QtCore import QSize, Qt  # noqa: E402
 from PySide6.QtGui import QFont, QFontMetrics  # noqa: E402
 from PySide6.QtWidgets import QApplication, QListView  # noqa: E402
 
-from widgets import (COLLAPSED_HEIGHT, COMPACT_ICON_PX, FileWidget,  # noqa: E402
+from widgets import (COMPACT_ICON_PX, FileWidget,  # noqa: E402
                      MIN_WIDGET_H, MIN_WIDGET_W, SCALE_MAX, SCALE_MIN,
                      SearchWidget, _icon_stats, _url_icon_file,
                      decode_thumbnail, get_file_icon, get_thumbnail_service,
-                     is_thumbnailable, scale_geometry, wrap_icon_label)
+                     is_thumbnailable, open_in_shell, scale_geometry,
+                     wrap_icon_label)
 
 _APP = QApplication.instance() or QApplication(sys.argv)
 
@@ -268,7 +269,7 @@ def test_search_widget_basic(tmp_path):
     widget._run_search()
     assert widget.list_widget.count() == 1
     assert widget.list_widget.item(0).data(Qt.UserRole).endswith("报告.docx")
-    assert "1 项" in widget.count_label.text()
+    assert "（文档）" in widget.list_widget.item(0).text()  # 行尾分类标签
     assert widget.height() > bar_height           # 有结果：窗口向下展开
     widget.close()
 
@@ -362,6 +363,31 @@ def test_get_file_icon_returns_nonnull(tmp_path):
     sample.write_text("x", encoding="utf-8")
     icon = get_file_icon(str(sample))
     assert icon is not None and not icon.isNull()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="startfile 仅 Windows")
+def test_open_in_shell_dispatches_and_never_raises(tmp_path, monkeypatch):
+    """open_in_shell：Windows 上经独立线程执行 startfile，异常只返回 False。
+
+    回归背景：直接在事件回调里调 os.startfile 曾偶发 Windows 致命异常
+    0x8001010D（RPC_E_CANTCALLOUT_INSYNCCALLLEVEL，见 app.log）。
+    本用例锁定行为契约：成功 True / 失败 False，绝不向上抛。
+    """
+    import widgets as widgets_mod
+
+    target = tmp_path / "文件.txt"
+    target.write_text("x", encoding="utf-8")
+
+    calls = []
+    monkeypatch.setattr(widgets_mod.os, "startfile", calls.append)
+    assert open_in_shell(str(target)) is True
+    assert calls == [str(target)]
+
+    def _boom(_path):
+        raise OSError("没有关联程序")
+
+    monkeypatch.setattr(widgets_mod.os, "startfile", _boom)
+    assert open_in_shell(str(target)) is False
 
 
 # ---------- 图片缩略图 ----------
@@ -557,7 +583,8 @@ def test_collapse_toggle_keeps_expanded_height(tmp_path):
 
     widget.set_collapsed(True)
 
-    assert widget.height() == COLLAPSED_HEIGHT
+    collapsed_h = widget.title_bar_height()
+    assert widget.height() == collapsed_h < 400   # 收起高度=标题行实际高度
     assert widget.list_widget.isHidden()
     assert events == [True]
 
@@ -585,7 +612,7 @@ def test_double_click_title_collapses_but_list_does_not(tmp_path):
         QApplication.sendEvent(widget, event)
 
     dblclick(10)                              # 标题栏：收起
-    assert widget.height() == COLLAPSED_HEIGHT
+    assert widget.height() == widget.title_bar_height()
 
     widget.set_collapsed(False)
     height = widget.height()

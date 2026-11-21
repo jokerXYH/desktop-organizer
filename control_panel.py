@@ -421,6 +421,7 @@ class ControlPanel(QWidget):
             "搜索收纳库", "支持文件名、拼音全拼与首字母。")
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("输入文件名关键词，如：报告")
+        self.search_edit.setClearButtonEnabled(True)   # 一键清空关键词与结果列表
         search_layout.addWidget(self.search_edit)
         self.search_list = QListWidget()
         self.search_list.setMinimumHeight(100)
